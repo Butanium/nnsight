@@ -63,7 +63,7 @@ class InterventionProxy(Proxy):
         protocols.LockProtocol.add(self.node)
 
         return self
-    
+
     def stop(self) -> InterventionProxy:
         """Method when called, indicates to the intervention graph to stop the execution of the model after this Proxy/Node is completed..
 
@@ -497,11 +497,31 @@ class HookHandler(AbstractContextManager):
 
             if hook_type == "input":
 
-                def input_hook(module, input, kwargs, module_path=module_path):
-                    return self.input_hook((input, kwargs), module_path)
+                def input_hook(
+                    module, input: Tuple, kwargs: Dict, module_path=module_path
+                ):
+
+                    for i, arg in enumerate(input):
+
+                        kwargs[i] = arg
+
+                    kwargs = self.input_hook(kwargs, module_path)
+
+                    return (
+                        tuple(
+                            [
+                                kwargs.pop(key)
+                                for key in kwargs.keys()
+                                if isinstance(key, int)
+                            ]
+                        ),
+                        kwargs,
+                    )
 
                 self.handles.append(
-                    module.register_forward_pre_hook(input_hook, with_kwargs=True, prepend=True)
+                    module.register_forward_pre_hook(
+                        input_hook, with_kwargs=True, prepend=True
+                    )
                 )
 
             elif hook_type == "output":
@@ -509,7 +529,9 @@ class HookHandler(AbstractContextManager):
                 def output_hook(module, input, output, module_path=module_path):
                     return self.output_hook(output, module_path)
 
-                self.handles.append(module.register_forward_hook(output_hook, prepend=True))
+                self.handles.append(
+                    module.register_forward_hook(output_hook, prepend=True)
+                )
 
         return self
 

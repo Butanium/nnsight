@@ -11,7 +11,6 @@ from .intervention import InterventionProtocol, InterventionProxy
 from .contexts.backends import EditBackend
 from .tracing import protocols
 
-
 class Envoy:
     """Envoy object act as proxies for torch modules within a model's module tree in order to add nnsight functionality.
     Proxies of the underlying module's output and input are accessed by `.output` and `.input` respectively.
@@ -210,11 +209,13 @@ class Envoy:
         if self._scanning():
 
             self._reset_proxies(propagate=False)
-
-            input = (input, input_kwargs)
+            
+            for i, arg in enumerate(input):
+                
+                input_kwargs[i] = arg
 
             self._fake_outputs.append(output)
-            self._fake_inputs.append(input)
+            self._fake_inputs.append(input_kwargs)
 
     def next(self, increment: int = 1, propagate: bool = False) -> Envoy:
 
