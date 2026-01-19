@@ -8,6 +8,8 @@ from typing_extensions import Self
 
 from .mixins import RemoteableMixin
 
+ID_CACHE = {}
+
 
 class HuggingFaceModel(RemoteableMixin):
 
@@ -91,7 +93,10 @@ class HuggingFaceModel(RemoteableMixin):
 
     def _remoteable_model_key(self) -> str:
 
-        repo_id = HfApi().model_info(self.repo_id).id
+        if self.repo_id not in ID_CACHE:
+            ID_CACHE[self.repo_id] = HfApi().model_info(self.repo_id).id
+
+        repo_id = ID_CACHE[self.repo_id]
 
         return json.dumps(
             {
