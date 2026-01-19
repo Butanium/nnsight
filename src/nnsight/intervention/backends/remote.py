@@ -140,16 +140,21 @@ class JobStatusDisplay:
         self._display_handle = None  # IPython DisplayHandle for flicker-free updates
 
     def _format_time(self, start_time: Optional[float]) -> str:
-        """Format elapsed time as human-readable string (e.g., '5.2s', '2m 30s', '1h 5m')."""
+        """Format elapsed time as human-readable string (e.g., '5.231s', '2m 30s', '1h 5m')."""
         if start_time is None:
-            return "0.0s"
+            return "0.000s" if self.verbose else "0.0s"
         elapsed = time.time() - start_time
+        # Use .3f precision in verbose mode, .1f otherwise
+        precision = 3 if self.verbose else 1
         if elapsed < 60:
-            return f"{elapsed:.1f}s"
+            return f"{elapsed:.{precision}f}s"
         elif elapsed < 3600:
             mins = int(elapsed // 60)
             secs = elapsed % 60
-            return f"{mins}m {secs:.0f}s"
+            if secs < 10:
+                return f"{mins}m {secs:.{precision}f}s"
+            else:
+                return f"{mins}m {secs:.0f}s"
         else:
             hours = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
@@ -471,7 +476,7 @@ class RemoteBackend(Backend):
         self.job_status = None
         self.status_display = JobStatusDisplay(
             enabled=CONFIG.APP.REMOTE_LOGGING,
-            verbose=verbose,
+            verbose=verbose or CONFIG.APP.DEBUG,
         )
 
     def request(self, tracer: Tracer) -> Tuple[bytes, Dict[str, str]]:
@@ -801,7 +806,9 @@ class RemoteBackend(Backend):
                 # Main event loop: receive status updates until completion
                 while True:
                     # Short timeout enables spinner animation updates
-                    timeout = 0.1 if CONFIG.APP.REMOTE_LOGGING else None
+                    timeout = None
+                    if CONFIG.APP.REMOTE_LOGGING:
+                        timeout = 0.001 if self.status_display.verbose else 0.1
                     try:
                         response = sio.receive(timeout=timeout)[1]
                     except socketio.exceptions.TimeoutError:
@@ -842,7 +849,10 @@ class RemoteBackend(Backend):
 
                 # Async event loop
                 while True:
-                    timeout = 0.1 if CONFIG.APP.REMOTE_LOGGING else None
+                    # Short timeout enables spinner animation updates
+                    timeout = None
+                    if CONFIG.APP.REMOTE_LOGGING:
+                        timeout = 0.001 if self.status_display.verbose else 0.1
                     try:
                         response = (await sio.receive(timeout=timeout))[1]
                     except socketio.exceptions.TimeoutError:
