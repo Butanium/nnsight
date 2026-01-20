@@ -1,6 +1,6 @@
 import os
 from typing import Optional
-
+import sys
 import yaml
 from pydantic import BaseModel
 
@@ -41,6 +41,7 @@ class ConfigModel(BaseModel):
             config = cls(**yaml.safe_load(file))
 
         config.from_env()
+        config.from_cli()
 
         return config
 
@@ -64,6 +65,12 @@ class ConfigModel(BaseModel):
         host = os.environ.get("NDIF_HOST", None)
         if host:
             self.API.HOST = host
+
+    def from_cli(self) -> None:
+
+        args = sys.argv
+        if "-d" in args or "--debug" in args:
+            self.APP.DEBUG = True
 
     def set_default_api_key(self, apikey: str):
 
