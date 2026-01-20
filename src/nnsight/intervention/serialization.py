@@ -191,6 +191,23 @@ def make_function(
     return func
 
 
+class SerializedFrame:
+    def __init__(self, co_filename: str, co_firstlineno: int, co_name: str):
+
+        self.f_locals = {}
+        self.f_globals = {}
+
+        self.f_code = types.SimpleNamespace(
+            co_filename=co_filename,
+            co_firstlineno=co_firstlineno,
+            co_name=co_name,
+        )
+
+
+def make_frame(co_filename: str, co_firstlineno: int, co_name: str) -> tuple:
+    return SerializedFrame(co_filename, co_firstlineno, co_name)
+
+
 class CustomCloudPickler(cloudpickle.Pickler):
     """A cloudpickle-based pickler that serializes functions by source code.
 
@@ -211,6 +228,29 @@ class CustomCloudPickler(cloudpickle.Pickler):
         >>> CustomCloudPickler(buffer).dump(my_func)
         >>> # Function is now serialized with its source code
     """
+
+    def reducer_override(self, obj):
+
+        result = super().reducer_override(obj)
+
+        if isinstance(obj, types.FrameType):
+            return self._frame_reduce(obj)
+
+        return result
+
+    def _frame_reduce(self, frame: types.FrameType) -> tuple:
+
+        return (
+            make_frame,
+            (
+                frame.f_code.co_filename,
+                frame.f_code.co_firstlineno,
+                frame.f_code.co_name,
+            ),
+            None,
+            None,
+            None,
+        )
 
     def _dynamic_function_reduce(self, func: types.FunctionType) -> tuple:
         """Serialize a function by capturing its source code and metadata.

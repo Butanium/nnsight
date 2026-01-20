@@ -147,11 +147,13 @@ class Tracer:
             Returns:
                 Dict containing serializable state information
             """
+
             return {
                 "source": self.source,
                 "start_line": self.start_line,
                 "filename": self.filename,
                 "cache_key": self.cache_key,
+                "frame": self.frame,
             }
 
         def __setstate__(self, state):
@@ -167,9 +169,9 @@ class Tracer:
             self.start_line = state["start_line"]
             self.filename = state["filename"]
             self.cache_key = state["cache_key"]
+            self.frame = state["frame"]
             # AST nodes cannot be serialized, so we reset to None
             self.node = None
-            self.frame = None
 
     # === Initialization ===
 
@@ -730,5 +732,4 @@ class Tracer:
         self.asynchronous = state["asynchronous"]
 
         # Reset values that cannot be reliably serialized
-        self.info.start_line = 0  # Line numbers may not be valid in new context
         self.backend = ExecutionBackend()  # Backend needs to be recreated
