@@ -58,6 +58,7 @@ from ...intervention.serialization import load, save
 from ...schema.request import RequestModel
 from ...schema.response import RESULT, ResponseModel
 from ..tracing.tracer import Tracer
+from ..tracing.util import wrap_exception
 from .base import Backend
 
 
@@ -356,7 +357,7 @@ class JobStatusDisplay:
         self, text: str, status_changed: bool, print_newline: bool = False
     ):
         """Display in Jupyter notebook using IPython DisplayHandle for flicker-free updates."""
-        from IPython.display import display, HTML
+        from IPython.display import HTML, display
 
         html_text = self._ansi_to_html(text)
         html_content = HTML(
@@ -382,10 +383,69 @@ class RemoteException(Exception):
     """Exception raised when a remote job fails on the NDIF server.
 
     Wraps error information returned from the server, including tracebacks
-    from the remote execution environment.
+    from the remote execution environment. Formats with rich text when
+    color output is supported.
     """
 
-    pass
+    def __init__(self, tb_string: str):
+        super().__init__(tb_string)
+        self.tb_string = tb_string
+
+    def __str__(self) -> str:
+        if not _SUPPORTS_COLOR:
+            return self.tb_string
+
+        try:
+            import io
+            import re
+
+            from rich.console import Console
+            from rich.highlighter import ReprHighlighter
+            from rich.text import Text
+
+            string_io = io.StringIO()
+            console = Console(file=string_io, force_terminal=True, soft_wrap=True)
+            highlighter = ReprHighlighter()
+
+            lines = self.tb_string.split("\n")
+
+            for i, line in enumerate(lines):
+                # Match "Traceback (most recent call last):"
+                if line.strip() == "Traceback (most recent call last):":
+                    console.print(Text(line, style="bold"))
+                # Match '  File "...", line N, in ...'
+                elif match := re.match(
+                    r'^(\s*File ")([^"]+)(", line )(\d+)(, in )(.+)$', line
+                ):
+                    text = Text()
+                    text.append(match.group(1))  # '  File "'
+                    text.append(match.group(2), style="cyan")  # filename
+                    text.append(match.group(3))  # '", line '
+                    text.append(match.group(4), style="yellow")  # line number
+                    text.append(match.group(5))  # ', in '
+                    text.append(match.group(6), style="magenta")  # function name
+                    console.print(text)
+                # Match indented code lines (4 spaces)
+                elif line.startswith("    "):
+                    # Use ReprHighlighter for basic Python highlighting
+                    text = Text(line)
+                    text = highlighter(text)
+                    console.print(text)
+                # Match exception line at end (Type: message)
+                elif i == len(lines) - 1 and ":" in line and not line.startswith(" "):
+                    parts = line.split(":", 1)
+                    text = Text()
+                    text.append(parts[0], style="bold red")
+                    if len(parts) > 1:
+                        text.append(":", style="bold")
+                        text.append(parts[1])
+                    console.print(text)
+                else:
+                    console.print(line)
+
+            return string_io.getvalue().rstrip()
+        except ImportError:
+            return self.tb_string
 
 
 class RemoteBackend(Backend):
@@ -521,15 +581,18 @@ class RemoteBackend(Backend):
         Returns:
             The execution result, or None if non-blocking and job not yet complete.
         """
-        if tracer is not None and tracer.asynchronous:
-            return self.async_request(tracer)
+        try:
+            if tracer is not None and tracer.asynchronous:
+                return self.async_request(tracer)
 
-        if self.blocking:
-            # Blocking mode: wait for completion via WebSocket
-            return self.blocking_request(tracer)
-        else:
-            # Non-blocking mode: submit or poll for existing job
-            return self.non_blocking_request(tracer)
+            if self.blocking:
+                # Blocking mode: wait for completion via WebSocket
+                return self.blocking_request(tracer)
+            else:
+                # Non-blocking mode: submit or poll for existing job
+                return self.non_blocking_request(tracer)
+        except Exception as e:
+            raise wrap_exception(e, None) from None
 
     def handle_response(
         self, response: ResponseModel, tracer: Optional[Tracer] = None
@@ -554,7 +617,7 @@ class RemoteBackend(Backend):
 
         if response.status == ResponseModel.JobStatus.ERROR:
             self.status_display.update(response.id, response.status.name, "")
-            raise RemoteException(f"{response.description}\nRemote exception.")
+            raise RemoteException(response.description)
 
         # Log response for user (skip STREAM status - it's internal)
         if response.status != ResponseModel.JobStatus.STREAM:

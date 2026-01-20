@@ -112,7 +112,8 @@ class ExceptionWrapper(Exception):
 
         self.infos = []
 
-        self.set_info(info)
+        if info is not None:
+            self.set_info(info)
 
     def set_info(self, info: "Tracer.Info"):
         """
@@ -149,7 +150,11 @@ class ExceptionWrapper(Exception):
                 lineno = current_tb.tb_lineno
                 name = frame.f_code.co_name
 
-                if "nnsight/" not in fname and not fname.startswith("<nnsight"):
+                if (
+                    CONFIG.APP.DEBUG
+                    or "nnsight/" not in fname
+                    and not fname.startswith("<nnsight")
+                ):
                     try:
                         line = linecache.getline(fname, lineno).strip()
                     except:
@@ -292,13 +297,12 @@ class ExceptionWrapper(Exception):
         for fname, lineno, func_name, code_line, is_internal in frames:
             # Build location text with appropriate styling
             location = Text()
-            dim = "dim " if is_internal else ""
-            location.append("  File ", style=f"{dim}")
-            location.append(f'"{fname}"', style=f"{dim}cyan")
-            location.append(", line ", style=f"{dim}")
-            location.append(str(lineno), style=f"{dim}yellow")
-            location.append(", in ", style=f"{dim}")
-            location.append(func_name, style=f"{dim}magenta")
+            location.append("  File ", style="")
+            location.append(f'"{fname}"', style="cyan")
+            location.append(", line ", style="")
+            location.append(str(lineno), style="yellow")
+            location.append(", in ", style="")
+            location.append(func_name, style="magenta")
             console.print(location)
 
             if code_line:
@@ -317,7 +321,7 @@ class ExceptionWrapper(Exception):
         console.print(exc_text)
 
 
-def wrap_exception(exception: Exception, info: "Tracer.Info"):
+def wrap_exception(exception: Exception, info: "Tracer.Info" = None):
     """
     Wraps an exception with additional context from the tracer.
 
@@ -339,7 +343,8 @@ def wrap_exception(exception: Exception, info: "Tracer.Info"):
         exception.__suppress_context__ = True  # Kills "... during handling ..."
         exception.__traceback__ = None
 
-        exception.set_info(info)
+        if info is not None:
+            exception.set_info(info)
         return exception
 
     # Create a dynamic exception type that inherits from both the original exception type
@@ -353,7 +358,6 @@ def wrap_exception(exception: Exception, info: "Tracer.Info"):
 
         def __init__(self, *args, **kwargs):
 
-            exception_type.__init__(self, *args, **kwargs)
             ExceptionWrapper.__init__(self, info, exception)
 
         def __str__(self):
