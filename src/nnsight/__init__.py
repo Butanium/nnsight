@@ -103,7 +103,7 @@ _original_excepthook = sys.excepthook
 
 def _nnsight_excepthook(exc_type, exc_value, exc_tb):
     """Custom exception hook that prints clean tracebacks for NNsight exceptions."""
-    if isinstance(exc_value, ExceptionWrapper) and not CONFIG.APP.DEBUG:
+    if isinstance(exc_value, ExceptionWrapper):
         # Print the reconstructed traceback with rich syntax highlighting
         # Pass outer_tb to include user code frames from the call stack
         exc_value.print_rich(file=sys.stderr, outer_tb=exc_tb)
