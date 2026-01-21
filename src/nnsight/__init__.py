@@ -106,7 +106,7 @@ def _nnsight_excepthook(exc_type, exc_value, exc_tb):
     if isinstance(exc_value, ExceptionWrapper):
         # Print the reconstructed traceback with rich syntax highlighting
         # Pass outer_tb to include user code frames from the call stack
-        exc_value.print_rich(file=sys.stderr, outer_tb=exc_tb)
+        exc_value.print_exception(file=sys.stderr, outer_tb=exc_tb)
     else:
         # Use the original exception hook for other exceptions or in DEBUG mode
         _original_excepthook(exc_type, exc_value, exc_tb)
@@ -121,8 +121,9 @@ try:
 
         def _nnsight_ipython_exception_handler(self, etype, evalue, tb, tb_offset=None):
             """Custom IPython exception handler for NNsight exceptions."""
-            if isinstance(evalue, ExceptionWrapper) and not CONFIG.APP.DEBUG:
-                evalue.print_rich(file=sys.stderr, outer_tb=tb)
+
+            if isinstance(evalue, ExceptionWrapper):
+                evalue.print_exception(file=sys.stderr, outer_tb=tb)
             else:
                 self.showtraceback((etype, evalue, tb), tb_offset=tb_offset)
 

@@ -259,11 +259,9 @@ class ExceptionWrapper(Exception):
         """Generates a formatted traceback string (without outer traceback)."""
         return self.format_traceback(outer_tb=None)
 
-    def print_rich(self, file=None, outer_tb=None):
+    def print_exception(self, file=None, outer_tb=None):
         """
-        Print the traceback with syntax highlighting using rich.
-
-        Falls back to plain text if rich is not available or terminal doesn't support it.
+        Print the formatted traceback.
 
         Args:
             file: Output file (default: sys.stderr)
@@ -272,53 +270,7 @@ class ExceptionWrapper(Exception):
         if file is None:
             file = sys.stderr
 
-        try:
-            from rich.console import Console
-            from rich.syntax import Syntax
-            from rich.text import Text
-
-            console = Console(file=file, force_terminal=None)
-
-            # If terminal doesn't support color, fall back to plain text
-            if not console.is_terminal:
-                print(self.format_traceback(outer_tb), file=file)
-                return
-
-        except ImportError:
-            # Rich not available, fall back to plain text
-            print(self.format_traceback(outer_tb), file=file)
-            return
-
-        # Collect all frames using shared logic
-        frames = self._collect_frames(outer_tb)
-
-        console.print(Text("Traceback (most recent call last):", style="bold"))
-
-        for fname, lineno, func_name, code_line, is_internal in frames:
-            # Build location text with appropriate styling
-            location = Text()
-            location.append("  File ", style="")
-            location.append(f'"{fname}"', style="cyan")
-            location.append(", line ", style="")
-            location.append(str(lineno), style="yellow")
-            location.append(", in ", style="")
-            location.append(func_name, style="magenta")
-            console.print(location)
-
-            if code_line:
-                syntax = Syntax(
-                    code_line, "python", theme="monokai", background_color="default"
-                )
-                console.print("    ", end="")
-                console.print(syntax)
-
-        # Print the exception type and message (with blank line before)
-        console.print()
-        exc_text = Text()
-        exc_text.append(type(self.original).__name__, style="bold red")
-        exc_text.append(": ", style="bold")
-        exc_text.append(str(self.original), style="")
-        console.print(exc_text)
+        print(self.format_traceback(outer_tb), file=file)
 
 
 def wrap_exception(exception: Exception, info: "Tracer.Info" = None):

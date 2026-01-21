@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import json
+import pkgutil
 import sys
+import sysconfig
 from enum import Enum
-from importlib.metadata import distributions
+from importlib.metadata import distributions, packages_distributions
 from io import StringIO
 from sys import stderr
 from typing import Union, types
 
 import requests
+from cloudpickle.cloudpickle import _PICKLE_BY_VALUE_MODULES, register_pickle_by_value
 from huggingface_hub import HfApi
 from rich.console import Console
 from rich.table import Table
-from cloudpickle import register_pickle_by_value
 
 from . import CONFIG
 
 
-def register(module: types.ModuleType):
+def register(module: types.ModuleType | str):
     """
     Register a local module for serialization by value when executing remotely on NDIF.
 
@@ -29,7 +31,8 @@ def register(module: types.ModuleType):
     This is a wrapper around ``cloudpickle.register_pickle_by_value``.
 
     Args:
-        module: The module to register for serialization by value.
+        module: The module to register for serialization by value. Can be the actual
+            module object or a string with the module's name.
 
     Note:
         - Call this function after importing the module but before using any of its
@@ -45,6 +48,9 @@ def register(module: types.ModuleType):
         >>> # Register the local module so it can be used remotely
         >>> register(mymodule)
         >>>
+        >>> # Or register by module name
+        >>> register("mymodule")
+        >>>
         >>> # Now you can use functions/classes from mymodule in remote execution
         >>> from mymodule.myfile import myfunction
         >>>
@@ -53,7 +59,10 @@ def register(module: types.ModuleType):
         ...     result = myfunction(model)
         ...     result.save()
     """
-    register_pickle_by_value(module)
+    if isinstance(module, str):
+        _PICKLE_BY_VALUE_MODULES.add(module)
+    else:
+        register_pickle_by_value(module)
 
 
 # Critical packages that should be highlighted in red if mismatched
@@ -345,172 +354,204 @@ def is_model_running(repo_id: str, revision: str = "main") -> bool:
     return False
 
 
-class NdifEnvComparison:
+NDIF_ENV = None
+
+
+def get_local_env() -> dict:
+    """Get the local Python environment information."""
+
+    # Build reverse mapping: dist_name -> [import_names]
+    pd_map = packages_distributions()
+    dist_to_imports = {}
+    for import_name, dist_names in pd_map.items():
+        for dist_name in dist_names:
+            if dist_name not in dist_to_imports:
+                dist_to_imports[dist_name] = []
+            dist_to_imports[dist_name].append(import_name)
+
+    packages = {}
+    for dist in distributions():
+        dist_name = dist.metadata["Name"]
+        version = dist.version
+
+        # Get import names from packages_distributions mapping
+        import_names = dist_to_imports.get(dist_name, [])
+
+        if import_names:
+            for imp_name in import_names:
+                packages[imp_name] = version
+        else:
+            # Fallback to distribution name if no import mapping found
+            packages[dist_name] = version
+
+    # Get stdlib and site-packages paths to filter them out
+    stdlib_path = sysconfig.get_paths()["stdlib"]
+    site_packages_paths = set()
+    for path in sys.path:
+        if "site-packages" in path or "dist-packages" in path:
+            site_packages_paths.add(path)
+
+    # Discover local modules from sys.path (not in stdlib or site-packages)
+    for importer, module_name, is_pkg in pkgutil.iter_modules():
+        if module_name not in packages and not module_name.startswith("_"):
+            # Check if this module comes from a local path
+            if hasattr(importer, "path"):
+                module_path = importer.path
+                # Skip stdlib and site-packages
+                if module_path.startswith(stdlib_path):
+                    continue
+                if any(module_path.startswith(sp) for sp in site_packages_paths):
+                    continue
+                # This is a local module
+                packages[module_name] = "local"
+
+    return {
+        "python_version": sys.version,
+        "packages": packages,
+    }
+
+
+def get_remote_env(force_refresh: bool = False) -> dict:
     """
-    Comparison of local and remote NDIF Python environments.
+    Fetch and cache the NDIF environment information from the remote server.
 
-    This class provides a structured comparison of Python versions and installed
-    packages between the local environment and the NDIF remote cluster.
+    Args:
+        force_refresh: If True, always refetch even if cached.
 
-    Example:
-        >>> from nnsight import ndif_env_compare
-        >>> comparison = ndif_env_compare()
-        >>> print(comparison)  # Displays a formatted comparison table
+    Returns:
+        The environment info from NDIF.
+
+    Raises:
+        Exception: If the request fails.
     """
+    global NDIF_ENV
+    if not force_refresh and NDIF_ENV is not None:
+        return NDIF_ENV
+    try:
+        response = requests.get(f"{CONFIG.API.HOST}/env", timeout=(5, 60))
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to fetch NDIF environment: {e}")
+    NDIF_ENV = response.json()
+    return NDIF_ENV
 
-    def __init__(self, local_env: dict, remote_env: dict):
-        """
-        Initialize NdifEnvComparison with local and remote environment data.
 
-        Args:
-            local_env: Dictionary with 'python_version' and 'packages' from local env.
-            remote_env: Dictionary with 'python_version' and 'packages' from NDIF.
-        """
-        self.local_env = local_env
-        self.remote_env = remote_env
-        self._table = self._build_table()
+def _supports_color() -> bool:
+    """
+    Check if the terminal supports color output.
 
-    @staticmethod
-    def get_local_env() -> dict:
-        """Get the local Python environment information."""
-        packages = {}
-        for dist in distributions():
-            packages[dist.metadata["Name"]] = dist.version
+    Returns:
+        True if color output is supported, False otherwise.
+    """
+    import os
+    import sys
 
-        return {
-            "python_version": sys.version,
-            "packages": packages,
-        }
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    return True
 
-    @classmethod
-    def request_env(cls) -> dict:
-        """
-        Fetch environment data from the NDIF API.
 
-        Returns:
-            The environment info from the NDIF cluster.
+_SUPPORTS_COLOR = _supports_color()
 
-        Raises:
-            Exception: If the request fails.
-        """
-        try:
-            response = requests.get(f"{CONFIG.API.HOST}/env", timeout=(5, 60))
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Failed to fetch NDIF environment: {e}")
 
-        return response.json()
+def build_table(local_env: dict, remote_env: dict) -> Table:
+    """Build the environment comparison table for local and remote."""
+    table = Table(
+        title="NDIF Environment Comparison",
+        show_lines=False,
+        expand=True,
+        highlight=_SUPPORTS_COLOR,
+    )
+    table.add_column("Package", no_wrap=True)
+    table.add_column("Local Version")
+    table.add_column("Remote Version")
+    table.add_column("Status")
 
-    def _build_table(self) -> Table:
-        """Build the comparison table."""
-        table = Table(title="NDIF Environment Comparison")
-        table.add_column("Package", no_wrap=True)
-        table.add_column("Local Version")
-        table.add_column("Remote Version")
-        table.add_column("Status")
+    local_packages = local_env.get("packages", {})
+    remote_packages = remote_env.get("packages", {})
 
-        local_packages = self.local_env.get("packages", {})
-        remote_packages = self.remote_env.get("packages", {})
+    # Only show packages that exist on the server
+    server_packages = set(remote_packages.keys())
 
-        # Only show packages that exist on the server
-        server_packages = set(remote_packages.keys())
+    # Sort with critical packages first, then alphabetically
+    def sort_key(pkg):
+        is_critical = pkg.lower() in CRITICAL_PACKAGES
+        return (not is_critical, pkg.lower())
 
-        # Sort with critical packages first, then alphabetically
-        def sort_key(pkg):
-            is_critical = pkg.lower() in CRITICAL_PACKAGES
-            return (not is_critical, pkg.lower())
+    for pkg in sorted(server_packages, key=sort_key):
+        local_ver = local_packages.get(pkg, "-")
+        remote_ver = remote_packages.get(pkg, "-")
 
-        for pkg in sorted(server_packages, key=sort_key):
-            local_ver = local_packages.get(pkg, "-")
-            remote_ver = remote_packages.get(pkg, "-")
+        if local_ver == remote_ver:
+            color = "dim"
+            status = "✓"
+        elif pkg.lower() in CRITICAL_PACKAGES:
+            color = "red"
+            status = "⚠ CRITICAL"
+        else:
+            color = "yellow"
+            status = "≠"
 
-            if local_ver == remote_ver:
-                # Same version - grey/dim
-                color = "dim"
-                status = "✓"
-            elif pkg.lower() in CRITICAL_PACKAGES:
-                # Different and critical - red
-                color = "red"
-                status = "⚠ CRITICAL"
-            else:
-                # Different but not critical - yellow
-                color = "yellow"
-                status = "≠"
-
+        if _SUPPORTS_COLOR:
             table.add_row(
                 f"[{color}]{pkg}[/]",
                 f"[{color}]{local_ver}[/]",
                 f"[{color}]{remote_ver}[/]",
                 f"[{color}]{status}[/]",
             )
-
-        return table
-
-    def __str__(self):
-        buf = StringIO()
-        console = Console(file=buf, force_terminal=True, stderr=False)
-
-        # Python version comparison
-        local_py = self.local_env.get("python_version", "Unknown").split()[0]
-        remote_py = self.remote_env.get("python_version", "Unknown").split()[0]
-
-        if local_py == remote_py:
-            py_color = "dim"
-            py_status = "✓"
         else:
-            py_color = "yellow"
-            py_status = "≠"
+            table.add_row(
+                pkg,
+                local_ver,
+                remote_ver,
+                status,
+            )
 
+    return table
+
+
+def compare() -> None:
+    """
+    Compare the local Python environment with the NDIF remote environment and print the results.
+
+    Returns:
+        None
+    """
+    local_env = get_local_env()
+    remote_env = get_remote_env()
+
+    buf = StringIO()
+    console = Console(
+        file=buf,
+        force_terminal=_SUPPORTS_COLOR,
+        color_system="auto" if _SUPPORTS_COLOR else None,
+        stderr=False,
+    )
+
+    # Python version comparison
+    local_py = local_env.get("python_version", "Unknown").split()[0]
+    remote_py = remote_env.get("python_version", "Unknown").split()[0]
+
+    if local_py == remote_py:
+        py_color = "dim"
+        py_status = "✓"
+    else:
+        py_color = "yellow"
+        py_status = "≠"
+
+    if _SUPPORTS_COLOR:
         console.print(f"[bold]Python Version:[/]")
         console.print(f"  [{py_color}]Local:  {local_py}[/]")
         console.print(f"  [{py_color}]Remote: {remote_py} {py_status}[/]")
-        console.print()
-        console.print(self._table)
-
-        return buf.getvalue()
-
-    def __repr__(self):
-        return self.__str__()
-
-
-def compare() -> Union[NdifEnvComparison, None]:
-    """
-    Compare the local Python environment with the NDIF remote environment.
-
-    Fetches environment information from both local and remote sources,
-    then displays a formatted comparison table showing version differences.
-
-    Colors:
-        - Grey/dim: Versions match
-        - Yellow: Versions differ
-        - Red: Versions differ for critical packages (nnsight, transformers, torch)
-
-    Returns:
-        NdifEnvComparison object with the comparison data, or None if the
-        request fails.
-
-    Example:
-        >>> from nnsight import ndif_env_compare
-        >>> comparison = ndif_env_compare()
-        >>> print(comparison)
-        Python Version:
-          Local:  3.10.12
-          Remote: 3.10.12 ✓
-
-                    NDIF Environment Comparison
-        ┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
-        ┃ Package      ┃ Local Version ┃ Remote Version ┃ Status     ┃
-        ┡━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
-        │ nnsight      │ 0.5.0         │ 0.5.0          │ ✓          │
-        │ torch        │ 2.1.0         │ 2.2.0          │ ⚠ CRITICAL │
-        │ transformers │ 4.36.0        │ 4.36.0         │ ✓          │
-        └──────────────┴───────────────┴────────────────┴────────────┘
-    """
-    try:
-        local_env = NdifEnvComparison.get_local_env()
-        remote_env = NdifEnvComparison.request_env()
-    except Exception as e:
-        print(e, file=stderr)
-        return None
-
-    return NdifEnvComparison(local_env, remote_env)
+    else:
+        console.print("Python Version:")
+        console.print(f"  Local:  {local_py}")
+        console.print(f"  Remote: {remote_py} {py_status}")
+    console.print()
+    table = build_table(local_env, remote_env)
+    console.print(table)
+    print(buf.getvalue())

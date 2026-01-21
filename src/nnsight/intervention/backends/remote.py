@@ -59,6 +59,7 @@ from ...schema.request import RequestModel
 from ...schema.response import RESULT, ResponseModel
 from ..tracing.tracer import Tracer
 from ..tracing.util import wrap_exception
+from ...ndif import get_remote_env, get_local_env, register
 from .base import Backend
 
 
@@ -379,12 +380,28 @@ class JobStatusDisplay:
             self._display_handle.update(html_content)
 
 
+_PULLED_ENV = False
+
+
+def pull_env():
+    """Pull the NDIF environment information from the remote server, and register any locally-available modules not present remotely."""
+    global _PULLED_ENV
+    if not _PULLED_ENV:
+        local_env = get_local_env()
+        remote_env = get_remote_env()
+        local_modules = set(local_env.get("packages", {}).keys())
+        remote_modules = set(remote_env.get("packages", {}).keys())
+        missing_modules = local_modules - remote_modules
+        for module in missing_modules:
+            register(module)
+        _PULLED_ENV = True
+
+
 class RemoteException(Exception):
     """Exception raised when a remote job fails on the NDIF server.
 
     Wraps error information returned from the server, including tracebacks
-    from the remote execution environment. Formats with rich text when
-    color output is supported.
+    from the remote execution environment.
     """
 
     def __init__(self, tb_string: str):
@@ -392,60 +409,7 @@ class RemoteException(Exception):
         self.tb_string = tb_string
 
     def __str__(self) -> str:
-        if not _SUPPORTS_COLOR:
-            return self.tb_string
-
-        try:
-            import io
-            import re
-
-            from rich.console import Console
-            from rich.highlighter import ReprHighlighter
-            from rich.text import Text
-
-            string_io = io.StringIO()
-            console = Console(file=string_io, force_terminal=True, soft_wrap=True)
-            highlighter = ReprHighlighter()
-
-            lines = self.tb_string.split("\n")
-
-            for i, line in enumerate(lines):
-                # Match "Traceback (most recent call last):"
-                if line.strip() == "Traceback (most recent call last):":
-                    console.print(Text(line, style="bold"))
-                # Match '  File "...", line N, in ...'
-                elif match := re.match(
-                    r'^(\s*File ")([^"]+)(", line )(\d+)(, in )(.+)$', line
-                ):
-                    text = Text()
-                    text.append(match.group(1))  # '  File "'
-                    text.append(match.group(2), style="cyan")  # filename
-                    text.append(match.group(3))  # '", line '
-                    text.append(match.group(4), style="yellow")  # line number
-                    text.append(match.group(5))  # ', in '
-                    text.append(match.group(6), style="magenta")  # function name
-                    console.print(text)
-                # Match indented code lines (4 spaces)
-                elif line.startswith("    "):
-                    # Use ReprHighlighter for basic Python highlighting
-                    text = Text(line)
-                    text = highlighter(text)
-                    console.print(text)
-                # Match exception line at end (Type: message)
-                elif i == len(lines) - 1 and ":" in line and not line.startswith(" "):
-                    parts = line.split(":", 1)
-                    text = Text()
-                    text.append(parts[0], style="bold red")
-                    if len(parts) > 1:
-                        text.append(":", style="bold")
-                        text.append(parts[1])
-                    console.print(text)
-                else:
-                    console.print(line)
-
-            return string_io.getvalue().rstrip()
-        except ImportError:
-            return self.tb_string
+        return self.tb_string
 
 
 class RemoteBackend(Backend):
@@ -553,6 +517,8 @@ class RemoteBackend(Backend):
         """
         interventions = super().__call__(tracer)
 
+        pull_env()
+
         data = RequestModel(interventions=interventions, tracer=tracer).serialize(
             self.compress
         )
@@ -591,7 +557,7 @@ class RemoteBackend(Backend):
             else:
                 # Non-blocking mode: submit or poll for existing job
                 return self.non_blocking_request(tracer)
-        except Exception as e:
+        except RemoteException as e:
             raise wrap_exception(e, None) from None
 
     def handle_response(
