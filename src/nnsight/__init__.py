@@ -46,7 +46,10 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("nnsight")
 except PackageNotFoundError:
-    __version__ = "unknown version"
+    try:
+        from ._version import version as __version__
+    except ImportError:
+        __version__ = "unknown version"
 
 from .ndif import *
 
