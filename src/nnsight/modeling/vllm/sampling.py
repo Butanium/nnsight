@@ -21,6 +21,8 @@ class NNsightSamplingParams(SamplingParams):
         state["mediator"] = self.mediator
 
         if isinstance(self.mediator, Mediator):
+            
+            self.mediator.intervention.__source__ = "".join(self.mediator.info.source)
 
             state["mediator"] = save(self.mediator)
 

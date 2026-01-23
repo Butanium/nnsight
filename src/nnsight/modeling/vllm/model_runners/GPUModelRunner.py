@@ -73,7 +73,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
                 if isinstance(new_req.sampling_params.mediator, bytes):
 
                     new_req.sampling_params.mediator = load(
-                        new_req.sampling_params.mediator, model
+                        new_req.sampling_params.mediator, model._remoteable_persistent_objects()
                     )
 
                 mediator = new_req.sampling_params.mediator
@@ -273,7 +273,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
                     continue
                 frame = req.sampling_params.mediator.info.frame
 
-                for key, value in frame.items():
+                for key, value in frame.f_locals.items():
 
                     if id(value) in Globals.saves:
                         result[key] = value

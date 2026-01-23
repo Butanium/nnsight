@@ -5,7 +5,6 @@ import warnings
 from collections import defaultdict
 from enum import Enum
 from functools import wraps
-from queue import SimpleQueue
 from threading import Thread
 from types import FrameType
 from typing import (
@@ -1022,7 +1021,7 @@ class Mediator:
 
         else:
 
-            self.info.frame.update(state)
+            self.info.frame.f_locals.update(state)
 
     def pull(self):
         """Pull variables from the interleaver state to the frame globals."""
@@ -1030,11 +1029,8 @@ class Mediator:
         if self.info.frame is None:
             return
 
-        state = (
-            self.info.frame.f_locals
-            if isinstance(self.info.frame, FrameType)
-            else self.info.frame
-        )
+        state =  self.info.frame.f_locals
+    
 
         state = {k: v for k, v in state.items() if not k.startswith(NNSIGHT_PREFIX)}
 
