@@ -69,7 +69,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
             last_mediator = None
 
             for new_req in new_reqs:
-
+                
                 if isinstance(new_req.sampling_params.mediator, bytes):
 
                     new_req.sampling_params.mediator = load(
@@ -143,7 +143,9 @@ class NNsightGPUModelRunner(GPUModelRunner):
             seen_mediators = set()
 
             for req_id, req in requests.items():
-
+                
+                req_id = req_id.split('-')[0]
+                
                 mediator = req.sampling_params.mediator
 
                 if req_id in finished_request_ids:
@@ -199,7 +201,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         self.nnsight_request_helper.process_new_reqs(
             scheduler_output.scheduled_new_reqs, self.nnsight_model
         )
-
+        
         self.nnsight_model._interleaver.batcher.needs_batching = (
             len(self.nnsight_model._interleaver.mediators) > 1
         )
@@ -215,19 +217,23 @@ class NNsightGPUModelRunner(GPUModelRunner):
         Globals.enter()
         with self.nnsight_model._interleaver:
 
-            super().execute_model(scheduler_output, intermediate_tensors)
+            return_value = super().execute_model(scheduler_output, intermediate_tensors)
 
             self.nnsight_request_helper.unflatten(self.nnsight_model)
+            
+            if self.execute_model_state is not None:
+    
+                logits = self.model.logits(self.execute_model_state.logits, hook=True)
 
-            logits = self.model.logits(self.execute_model_state.logits, hook=True)
+                state = self.execute_model_state
 
-            state = self.execute_model_state
-
-            self.execute_model_state = type(state)(
-                **{**state._asdict(), "logits": logits}
-            )
+                self.execute_model_state = type(state)(
+                    **{**state._asdict(), "logits": logits}
+                )
 
         Globals.exit()
+        
+        return return_value
 
     def _sample(self, *args, **kwargs):
 
@@ -265,10 +271,16 @@ class NNsightGPUModelRunner(GPUModelRunner):
             result = {}
 
             removals = set()
+            
+            requests = {}
+            
+            for request in self.requests.values():
+                internal_id = request.req_id.split('-')[0]
+                requests[internal_id] = request
 
             # TODO saves need to be removed on all processes
             for req in finished_requests:
-                req = self.requests[req.request_id]
+                req = requests[req.request_id]
                 if req.sampling_params.mediator is None:
                     continue
                 frame = req.sampling_params.mediator.info.frame
@@ -287,7 +299,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         with self.nnsight_model._interleaver:
 
             for req_id in finished_req_ids:
-                req = self.requests[req_id]
+                req = requests[req_id]
                 req.sampling_params.mediator.cancel()
 
             self.nnsight_model._interleaver.handle()
