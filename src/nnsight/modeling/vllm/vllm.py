@@ -207,17 +207,19 @@ class VLLM(RemoteableMixin):
                 prompts.append(prompt)
                 params.append(param)
 
-        return (prompts, params), {}
+        kwargs = kwargs if not args else {}
+
+        return (prompts, params), kwargs, len(prompts)
 
     def _batch(
         self, batched_inputs, prompts, params, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
 
-        batch_size = len(prompts)
+        kwargs = {**kwargs, **batched_inputs[1]}
 
-        if batched_inputs is None:
+        if len(batched_inputs[0]) == 0:
 
-            return ((prompts, params), kwargs), batch_size
+            return (prompts, params), kwargs
 
         batched_args = batched_inputs[0]
         batched_kwargs = batched_inputs[1]
@@ -225,9 +227,7 @@ class VLLM(RemoteableMixin):
         batched_args[0].extend(prompts)
         batched_args[1].extend(params)
 
-        batched_kwargs.update(kwargs)
-
-        return batched_inputs, batch_size
+        return batched_args, batched_kwargs
 
     def __call__(
         self,
@@ -238,18 +238,17 @@ class VLLM(RemoteableMixin):
 
         default_param = NNsightSamplingParams.from_optional()
 
-        kwargs.pop("hook", None)
-
         param_idx = 0
 
         # Find the sampling params associated with each mediator
         for mediator in self._interleaver.mediators:
 
-            batch_start, batch_size = mediator.batch_group
-
             # If its the only invoker in the batch group, set the batch size to the total number of prompts
-            if batch_size == -1:
+            if mediator.batch_group is None:
                 batch_size = len(params)
+
+            else:
+                batch_size = mediator.batch_group[1]
 
             # For each prompt in the batch group associated with the mediator
             for i in range(batch_size):
@@ -271,6 +270,7 @@ class VLLM(RemoteableMixin):
                         setattr(param, attr, value)
 
         # Do VLLM generation with NNsight
+        print("prompts", prompts)
         outputs = self.vllm_entrypoint.generate(prompts, sampling_params=params)
 
         saves = {}
@@ -290,7 +290,9 @@ class VLLM(RemoteableMixin):
 
     def interleave(self, fn: Callable, *args, **kwargs):
         """Execute the traced function with vLLM, dispatching the engine if needed."""
-        if not self.dispatched and not isinstance(self._interleaver.tracer, ScanningTracer):
+        if not self.dispatched and not isinstance(
+            self._interleaver.tracer, ScanningTracer
+        ):
             self.dispatch()
 
         try:
