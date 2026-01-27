@@ -8,11 +8,18 @@ class Batchable:
 
     ### Abstract methods ###
 
-    def _prepare_input(self, *inputs, **kwargs):
+    def _prepare_input(
+        self, *inputs, **kwargs
+    ) -> tuple[tuple[Any], dict[str, Any], int]:
 
-        return inputs, kwargs
+        if inputs or kwargs:
+            return inputs, kwargs, 1
 
-    def _batch(self, batched_input, *args, **kwargs):
+        return inputs, kwargs, 0
+
+    def _batch(
+        self, batched_input, *args, **kwargs
+    ) -> tuple[tuple[Any], dict[str, Any]]:
 
         raise NotImplementedError(
             "Batching not implemented for this model and is required for multiple invokers"
@@ -23,8 +30,8 @@ class Batcher:
 
     def __init__(self, *args, **kwargs):
 
-        self.batched_args = args
-        self.batched_kwargs = kwargs
+        self.batched_args = None
+        self.batched_kwargs = None
 
         self.last_batch_group: Optional[List[int]] = None
         self.needs_batching = False
@@ -42,32 +49,29 @@ class Batcher:
 
         if args or kwargs:
 
-            args, kwargs = batchable._prepare_input(*args, **kwargs)
+            args, kwargs, batch_size = batchable._prepare_input(*args, **kwargs)
+
+            batch_group = [0, batch_size] if batch_size else None
+
+            if self.batched_args is None:
+                self.batched_args = args
+                self.batched_kwargs = kwargs
+
+                self.last_batch_group = batch_group
+
+                return (args, kwargs), batch_group
+
+            self.batched_args, self.batched_kwargs = batchable._batch(
+                (self.batched_args, self.batched_kwargs), *args, **kwargs
+            )
+
+            if batch_group is None:
+                return (args, kwargs), None
 
             if self.last_batch_group is None:
-                self.batched_args = args
-                self.batched_kwargs.update(kwargs)
-
-                self.last_batch_group = [-1, -1]
-
+                self.last_batch_group = batch_group
             else:
-
-                if self.last_batch_group == [-1, -1]:
-                    (self.batched_args, self.batched_kwargs), batch_size = (
-                        batchable._batch(
-                            None, *self.batched_args, **self.batched_kwargs
-                        )
-                    )
-
-                    self.last_batch_group[0] = 0
-                    self.last_batch_group[1] = batch_size
-
-                (self.batched_args, self.batched_kwargs), batch_size = batchable._batch(
-                    (self.batched_args, self.batched_kwargs), *args, **kwargs
-                )
-
                 self.last_batch_group = [sum(self.last_batch_group), batch_size]
-
                 self.needs_batching = True
 
             return (args, kwargs), self.last_batch_group

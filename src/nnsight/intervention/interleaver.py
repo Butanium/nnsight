@@ -1029,8 +1029,7 @@ class Mediator:
         if self.info.frame is None:
             return
 
-        state =  self.info.frame.f_locals
-    
+        state = self.info.frame.f_locals
 
         state = {k: v for k, v in state.items() if not k.startswith(NNSIGHT_PREFIX)}
 

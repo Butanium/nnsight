@@ -397,7 +397,7 @@ class Envoy(Batchable):
     def __call__(self, *args, hook: bool = False, **kwargs):
         return (
             self._module.forward(*args, **kwargs)
-            if self.interleaving and not hook
+            if self._interleaver.current is not None and not hook
             else self._module(*args, **kwargs)
         )
 
@@ -440,7 +440,6 @@ class Envoy(Batchable):
 
         if fn is None:
             fn = self.__call__
-            kwargs["hook"] = True
 
         return tracer_cls(fn, self, *args, **kwargs)
 

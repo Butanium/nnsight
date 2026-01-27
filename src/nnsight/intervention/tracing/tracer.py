@@ -353,18 +353,29 @@ class InterleavingTracer(Tracer):
 
                 self.mediators.append(mediator)
 
-        # If positional arguments were passed directly to a tracer, assume one invoker
-        if self.args:
+        # If  arguments were passed directly to a tracer, assume one invoker if their input contributes to batch size
+        if self.args or self.kwargs:
 
-            invoker = self.invoke(*self.args, _info=self.info.copy())
+            batched_args, batched_kwargs, batch_size = self.model._prepare_input(
+                *self.args, **self.kwargs
+            )
 
-            invoker.__exit__(ExitTracingException, None, None)
+            # If real input, create a root invoker (no other invokers can be created)
+            if batch_size:
 
-            invoker.info.start_line = 0
+                invoker = self.invoke(*self.args, **self.kwargs, _info=self.info.copy())
 
-            self.info.source = [
-                f"    {self.tracer_var_name}.mediators[-1].info.frame = {self.tracer_var_name}.get_frame()\n"
-            ]
+                invoker.__exit__(ExitTracingException, None, None)
+
+                invoker.info.start_line = 0
+
+                self.info.source = [
+                    f"    {self.tracer_var_name}.mediators[-1].info.frame = {self.tracer_var_name}.get_frame()\n"
+                ]
+            # Otherwise just pass kwargs through
+            else:
+                self.batcher.batched_args = batched_args
+                self.batcher.batched_kwargs = batched_kwargs
 
         self.info.source = [
             f"def __nnsight_tracer_{abs(self.info.cache_key) if self.info.cache_key is not None else id(self)}__(__nnsight_tracing_info__,{self.tracer_var_name}):\n",
@@ -394,7 +405,7 @@ class InterleavingTracer(Tracer):
         fn(self.info, self)
 
         args = self.batcher.batched_args
-        kwargs = {**self.batcher.batched_kwargs, **self.kwargs}
+        kwargs = self.batcher.batched_kwargs
 
         self.batcher.batched_args = tuple()
         self.batcher.batched_kwargs = {}
