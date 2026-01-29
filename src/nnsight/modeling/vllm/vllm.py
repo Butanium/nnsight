@@ -1,7 +1,17 @@
 from ... import NNS_VLLM_VERSION
 
-import torch
 import vllm
+
+# Check vLLM version compatibility
+_installed_version = getattr(vllm, "__version__", "unknown")
+if _installed_version != NNS_VLLM_VERSION:
+    raise ImportError(
+        f"nnsight requires vLLM version {NNS_VLLM_VERSION}, but found {_installed_version}. "
+        f"Please install the correct version:\n\n"
+        f"    pip install vllm=={NNS_VLLM_VERSION}\n"
+    )
+
+import torch
 
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple, Union
