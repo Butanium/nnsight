@@ -502,10 +502,12 @@ class RemoteBackend(Backend):
         else:
             self.ws_address = "ws://" + self.address[7:]
 
+        self.verbose = verbose or CONFIG.APP.DEBUG
+
         self.job_status = None
         self.status_display = JobStatusDisplay(
             enabled=CONFIG.APP.REMOTE_LOGGING,
-            verbose=verbose or CONFIG.APP.DEBUG,
+            verbose=self.verbose,
         )
 
     def request(self, tracer: Tracer) -> Tuple[bytes, Dict[str, str]]:
@@ -527,6 +529,9 @@ class RemoteBackend(Backend):
         data = RequestModel(interventions=interventions, tracer=tracer).serialize(
             self.compress
         )
+
+        if self.verbose:
+            print(f"[RemoteBackend] Payload: {len(data)} bytes")
 
         headers = {
             "nnsight-model-key": self.model_key,
@@ -695,6 +700,11 @@ class RemoteBackend(Backend):
         Returns:
             The deserialized result object.
         """
+
+        if self.verbose:
+            result_bytes.seek(0)
+            print(f"[RemoteBackend] Result: {result_bytes.getbuffer().nbytes} bytes")
+
         result_bytes.seek(0)
 
         # Decompress if compression was enabled
