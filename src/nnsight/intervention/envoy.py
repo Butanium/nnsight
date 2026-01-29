@@ -1098,36 +1098,19 @@ class Envoy(Batchable):
 
     def __getstate__(self):
 
-        self._interleaver._persistent_id = "Interleaver"
-        self._module._persistent_id = f"Module:{self.path}"
-        return {
-            "alias": self._alias,
-            "children": self._children,
-            "named_children": {
-                key: value
-                for key, value in self.__dict__.items()
-                if isinstance(value, Envoy)
-            },
-            "path": self.path,
-            "default_mediators": self._default_mediators,
-            "interleaver": self._interleaver,
-            "module": self._module,
-        }
+        state = self.__dict__.copy()
+
+        state["_interleaver"]._persistent_id = "Interleaver"
+        state["_module"]._persistent_id = f"Module:{self.path}"
+
+        state.pop("_fake_inputs")
+        state.pop("_fake_output")
+        state.pop("_source")
+
+        return state
 
     def __setstate__(self, state):
-        self._module = None
-        self._source = None
-        self.fake_inputs = None
-        self.fake_output = None
-
-        self._alias = state["alias"]
-        self._children = state["children"]
-        self.__dict__.update(state["named_children"])
-
-        self.path = state["path"]
-        self._default_mediators = state["default_mediators"]
-        self._interleaver = state["interleaver"]
-        self._module = state["module"]
+        self.__dict__.update(state)
 
 
 # TODO extend Envoy
