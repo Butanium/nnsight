@@ -12,13 +12,27 @@ from typing import Any
 from ..tracing.globals import Globals
 from ..tracing.util import wrap_exception
 from .base import Backend
+from .remote import pull_env
 
 
 # Modules available on NDIF servers (same as remote.py)
 SERVER_MODULES = {
-    'torch', 'numpy', 'transformers', 'accelerate', 'einops',
-    'collections', 'itertools', 'functools', 'operator', 'math',
-    'random', 'json', 're', 'typing', 'dataclasses', 'abc',
+    "torch",
+    "numpy",
+    "transformers",
+    "accelerate",
+    "einops",
+    "collections",
+    "itertools",
+    "functools",
+    "operator",
+    "math",
+    "random",
+    "json",
+    "re",
+    "typing",
+    "dataclasses",
+    "abc",
 }
 
 
@@ -42,6 +56,7 @@ class LocalSimulationBackend(Backend):
 
         # Step 2: Serialize
         request = RequestModel(interventions=interventions, tracer=tracer)
+        pull_env()
         payload = request.serialize(compress=False)
 
         if self.verbose:
@@ -53,7 +68,9 @@ class LocalSimulationBackend(Backend):
 
         blocked = self._block_user_modules()
         try:
-            restored = RequestModel.deserialize(payload, persistent_objects, compress=False)
+            restored = RequestModel.deserialize(
+                payload, persistent_objects, compress=False
+            )
         finally:
             self._restore_modules(blocked)
 
@@ -68,40 +85,42 @@ class LocalSimulationBackend(Backend):
 
     def _block_user_modules(self):
         """Block non-server modules from sys.modules and sys.path."""
-        blocked = {'modules': {}, 'paths': []}
+        blocked = {"modules": {}, "paths": []}
 
         # Block paths that could contain user modules
         # Keep only: site-packages, stdlib paths, and src/ for nnsight
         for path in list(sys.path):
             # Keep package installation paths
-            if 'site-packages' in path:
+            if "site-packages" in path:
                 continue
-            if 'lib/python' in path:
+            if "lib/python" in path:
                 continue
             # Keep nnsight src path
-            if path.endswith('/src') or '/src/nnsight' in path:
+            if path.endswith("/src") or "/src/nnsight" in path:
                 continue
             # Block everything else (tests/, user directories, etc.)
-            blocked['paths'].append(path)
+            blocked["paths"].append(path)
             sys.path.remove(path)
 
         # Block non-server modules
         for name in list(sys.modules.keys()):
-            root = name.split('.')[0]
+            root = name.split(".")[0]
             if root in SERVER_MODULES:
                 continue
             if root in sys.stdlib_module_names:
                 continue
-            if 'nnsight' in name:
+            if "nnsight" in name:
                 continue
-            blocked['modules'][name] = sys.modules.pop(name)
+            blocked["modules"][name] = sys.modules.pop(name)
 
         if self.verbose:
-            print(f"[LocalSimulation] Blocked {len(blocked['modules'])} modules, {len(blocked['paths'])} paths")
+            print(
+                f"[LocalSimulation] Blocked {len(blocked['modules'])} modules, {len(blocked['paths'])} paths"
+            )
 
         return blocked
 
     def _restore_modules(self, blocked):
         """Restore previously blocked modules and paths."""
-        sys.modules.update(blocked['modules'])
-        sys.path.extend(blocked['paths'])
+        sys.modules.update(blocked["modules"])
+        sys.path.extend(blocked["paths"])

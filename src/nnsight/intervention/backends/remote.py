@@ -388,13 +388,18 @@ def pull_env():
     global _PULLED_ENV
     if not _PULLED_ENV:
         local_env = get_local_env()
-        remote_env = get_remote_env()
-        local_modules = set(local_env.get("packages", {}).keys())
-        remote_modules = set(remote_env.get("packages", {}).keys())
-        missing_modules = local_modules - remote_modules
-        for module in missing_modules:
-            register(module)
-        _PULLED_ENV = True
+
+        for package, version in local_env.get("packages", {}).items():
+            if version == "local":
+                register(package)
+
+        # remote_env = get_remote_env()
+        # local_modules = set(local_env.get("packages", {}).keys())
+        # remote_modules = set(remote_env.get("packages", {}).keys())
+        # missing_modules = local_modules - remote_modules
+        # for module in missing_modules:
+        #     register(module)
+        # _PULLED_ENV = True
 
 
 class RemoteException(Exception):
