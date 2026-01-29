@@ -33,6 +33,7 @@ Example:
     >>> restored(5)  # Returns 15
 """
 
+import dataclasses
 import inspect
 import io
 import pickle
@@ -45,6 +46,23 @@ from typing import Any, BinaryIO, Optional, Union
 import cloudpickle
 import cloudpickle.cloudpickle as _cloudpickle_internal
 from cloudpickle.cloudpickle import _function_getstate, _get_cell_contents
+
+# Names of methods that the @dataclass decorator generates dynamically
+_DATACLASS_GENERATED_METHODS = frozenset(
+    {
+        "__init__",
+        "__repr__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__hash__",
+        "__setattr__",
+        "__delattr__",
+    }
+)
 
 # Default pickle protocol - protocol 4 is available in Python 3.4+ and supports large objects
 DEFAULT_PROTOCOL = 4
@@ -189,6 +207,210 @@ def _extract_lambda_source(source: str, code: types.CodeType) -> str:
     return result
 
 
+def _is_dataclass_generated_method(func: types.FunctionType) -> bool:
+    """Check if a function is a dynamically generated dataclass method.
+
+    Dataclass methods like __init__, __repr__, __eq__, etc. are generated
+    dynamically by the @dataclass decorator using exec(). They don't have
+    inspectable source code, so we need to detect them and handle them specially.
+
+    Detection criteria:
+    1. The function name is one of the known dataclass-generated method names
+    2. The function's qualname suggests it's a method (contains '.')
+    3. Trying to get source fails (dynamically generated)
+    4. The enclosing class is a dataclass
+
+    Args:
+        func: The function to check.
+
+    Returns:
+        True if this appears to be a dataclass-generated method.
+    """
+    # Quick check: is this a known dataclass method name?
+    if func.__name__ not in _DATACLASS_GENERATED_METHODS:
+        return False
+
+    # Check if it looks like a method (qualname contains class name)
+    qualname = getattr(func, "__qualname__", "")
+    if "." not in qualname:
+        return False
+
+    # Try to verify source is unavailable (dataclass methods are exec'd)
+    try:
+        inspect.getsource(func)
+        # If we got source, it's not a dataclass-generated method
+        return False
+    except OSError:
+        pass
+
+    # Try to find the class and check if it's a dataclass
+    # The qualname format is "ClassName.method_name" or "Outer.ClassName.method_name"
+    class_qualname = qualname.rsplit(".", 1)[0]
+    module = func.__globals__.get("__name__")
+
+    if module:
+        import sys
+
+        mod = sys.modules.get(module)
+        if mod:
+            # Try to find the class by traversing the qualname
+            try:
+                obj = mod
+                for part in class_qualname.split("."):
+                    obj = getattr(obj, part)
+                if isinstance(obj, type) and dataclasses.is_dataclass(obj):
+                    return True
+            except AttributeError:
+                pass
+
+    # Fallback: check if the globals contain dataclass-related markers
+    # This catches cases where the class might not be easily accessible
+    return False
+
+
+def _make_dataclass_skeleton(
+    name: str,
+    bases: tuple,
+    type_kwargs: dict,
+    fields_info: list,
+    dataclass_params: dict,
+    class_tracker_id: str,
+) -> type:
+    """Reconstruct a dataclass skeleton that will have @dataclass applied.
+
+    This creates a class with the field annotations and then applies the
+    @dataclass decorator to regenerate all the methods (__init__, __repr__, etc.)
+    for the current Python version.
+
+    Args:
+        name: Class name.
+        bases: Base classes tuple.
+        type_kwargs: Additional type kwargs (__module__, etc.).
+        fields_info: List of (field_name, field_type, field_obj_or_default) tuples.
+        dataclass_params: Parameters passed to @dataclass decorator.
+        class_tracker_id: Tracking ID for class identity preservation.
+
+    Returns:
+        The reconstructed dataclass.
+    """
+    # Build the class namespace with annotations and defaults
+    namespace = {}
+    annotations = {}
+
+    for field_name, field_type, field_default in fields_info:
+        annotations[field_name] = field_type
+        if field_default is not dataclasses.MISSING:
+            namespace[field_name] = field_default
+
+    namespace["__annotations__"] = annotations
+
+    # Merge in type_kwargs
+    namespace.update(type_kwargs)
+
+    # Create the class
+    cls = type(name, bases, namespace)
+
+    # Apply the @dataclass decorator with the original parameters
+    cls = dataclasses.dataclass(**dataclass_params)(cls)
+
+    # Track for identity preservation (like cloudpickle does)
+    return _cloudpickle_internal._lookup_class_or_track(class_tracker_id, cls)
+
+
+def _dataclass_reduce(cls: type) -> tuple:
+    """Reduce a dataclass for pickling in a cross-version compatible way.
+
+    Instead of pickling the dynamically generated methods (which use
+    version-specific bytecode), we pickle the class definition and
+    dataclass parameters. On deserialization, @dataclass is re-applied
+    to regenerate all methods for the target Python version.
+
+    Args:
+        cls: The dataclass to reduce.
+
+    Returns:
+        A tuple for pickle's reduce protocol.
+    """
+    # Get the dataclass parameters
+    params = getattr(cls, "__dataclass_params__", None)
+    if params is None:
+        # Fallback to defaults
+        dataclass_params = {}
+    else:
+        dataclass_params = {
+            "init": params.init,
+            "repr": params.repr,
+            "eq": params.eq,
+            "order": params.order,
+            "unsafe_hash": params.unsafe_hash,
+            "frozen": params.frozen,
+        }
+        # Add newer params if they exist
+        if hasattr(params, "match_args"):
+            dataclass_params["match_args"] = params.match_args
+        if hasattr(params, "kw_only"):
+            dataclass_params["kw_only"] = params.kw_only
+        if hasattr(params, "slots"):
+            dataclass_params["slots"] = params.slots
+
+    # Extract field information
+    fields_info = []
+    for field in dataclasses.fields(cls):
+        # Get the field type (might be a string annotation or actual type)
+        field_type = field.type
+
+        # Determine the default value
+        if field.default is not dataclasses.MISSING:
+            field_default = field.default
+        elif field.default_factory is not dataclasses.MISSING:
+            # For default_factory, we need to wrap it in a Field object
+            field_default = dataclasses.field(default_factory=field.default_factory)
+        else:
+            field_default = dataclasses.MISSING
+
+        fields_info.append((field.name, field_type, field_default))
+
+    # Get type kwargs for reconstruction
+    type_kwargs = {}
+    if "__module__" in cls.__dict__:
+        type_kwargs["__module__"] = cls.__module__
+
+    # Get class tracker ID for identity preservation
+    class_tracker_id = _cloudpickle_internal._get_or_create_tracker_id(cls)
+
+    # Get the class state (non-generated attributes)
+    clsdict, slotstate = _cloudpickle_internal._class_getstate(cls)
+
+    # Remove dataclass-generated methods from the class dict
+    # These will be regenerated by @dataclass on the other end
+    for method_name in _DATACLASS_GENERATED_METHODS:
+        clsdict.pop(method_name, None)
+
+    # Also remove dataclass internal attributes that will be regenerated
+    clsdict.pop("__dataclass_fields__", None)
+    clsdict.pop("__dataclass_params__", None)
+
+    args = (
+        cls.__name__,
+        cls.__bases__,
+        type_kwargs,
+        fields_info,
+        dataclass_params,
+        class_tracker_id,
+    )
+
+    state = (clsdict, slotstate)
+
+    return (
+        _make_dataclass_skeleton,
+        args,
+        state,
+        None,
+        None,
+        _cloudpickle_internal._class_setstate,
+    )
+
+
 def make_function(
     source: str,
     name: str,
@@ -258,7 +480,12 @@ def make_function(
         # pattern requires them at function creation time. However, the globals
         # (including any self-references) ARE deferred to the state setter.
         closure_params = ", ".join(closure_names)
-        factory_source = f"def _seri_factory_({closure_params}):\n"
+        # Prepend 'from __future__ import annotations' so type annotations are
+        # stored as strings and not evaluated at function definition time.
+        # Without this, annotations like 'x: SomeType' would fail if SomeType
+        # isn't in the limited func_globals used during reconstruction.
+        factory_source = "from __future__ import annotations\n"
+        factory_source += f"def _seri_factory_({closure_params}):\n"
 
         # Lambdas have '<lambda>' as their name, which is not valid Python syntax.
         # We handle them by assigning the lambda expression to a temporary variable.
@@ -289,7 +516,7 @@ def make_function(
         if defaults:
             func.__defaults__ = tuple(defaults)
     else:
-        # NO CLOSURE: Compile source directly and extract the code object.
+
         try:
             module_code = compile(source, filename or "<serialization>", "exec")
         except SyntaxError as e:
@@ -423,6 +650,13 @@ class CustomCloudPickler(cloudpickle.Pickler):
     """
 
     def reducer_override(self, obj):
+        # Special handling for dataclass classes
+        # We serialize them in a way that re-applies @dataclass on deserialization,
+        # which regenerates all methods for the target Python version
+        if isinstance(obj, type) and dataclasses.is_dataclass(obj):
+            # Check if this should be pickled by reference (importable module attribute)
+            if not _cloudpickle_internal._should_pickle_by_reference(obj):
+                return _dataclass_reduce(obj)
 
         result = super().reducer_override(obj)
 
@@ -483,6 +717,15 @@ class CustomCloudPickler(cloudpickle.Pickler):
             for functions where source inspection might fail (e.g., dynamically
             generated functions with attached source).
         """
+        # Check if this is a dataclass-generated method (like __init__, __repr__, etc.)
+        # These are created dynamically by exec() and have no source code.
+        # Fall back to cloudpickle's bytecode-based serialization for these.
+        # Note: The dataclass class itself is handled specially in reducer_override,
+        # which re-applies @dataclass on deserialization to regenerate these methods.
+        if _is_dataclass_generated_method(func):
+            # Use cloudpickle's default bytecode-based serialization
+            return super()._dynamic_function_reduce(func)
+
         # Get source code - prefer explicit __source__ attribute if present.
         # This allows users to attach source to dynamically generated functions
         # where inspect.getsource() would fail.
