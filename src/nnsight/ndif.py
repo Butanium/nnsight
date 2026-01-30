@@ -244,7 +244,7 @@ class NdifStatus(dict):
         return self.__str__()
 
 
-def ndif_status(raw: bool = False) -> Union[dict, NdifStatus]:
+def status(raw: bool = False) -> Union[dict, NdifStatus]:
     """
     Query the current status of the NDIF service and all deployed models.
 
@@ -317,6 +317,11 @@ def ndif_status(raw: bool = False) -> Union[dict, NdifStatus]:
 
         return NdifStatus(formatted_response)
 
+def ndif_status(raw: bool = False) -> Union[dict, NdifStatus]:
+    """
+    Deprecated: Use status() instead.
+    """
+    return status(raw)
 
 def is_model_running(repo_id: str, revision: str = "main") -> bool:
     """
