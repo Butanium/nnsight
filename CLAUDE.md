@@ -350,7 +350,7 @@ with model.trace("Hello"):
 
 ### The `.save()` Method
 
-**Critical:** Values are garbage collected unless you call `.save()`:
+**Critical:** Values are garbage collected unless you save them:
 
 ```python
 with model.trace("Hello"):
@@ -361,21 +361,19 @@ with model.trace("Hello"):
     output = model.transformer.h[-1].output[0].save()
 ```
 
-**Two ways to save:**
+**Two ways to save — prefer `nnsight.save()`:**
 
 ```python
-# Method 1: .save() on tensor (uses pymount C extension)
-output = model.transformer.h[-1].output[0].save()
-
-# Method 2: nnsight.save() - PREFERRED (works for all objects)
 import nnsight
+
+# PREFERRED: nnsight.save() — works on any object, no C extension needed
 output = nnsight.save(model.transformer.h[-1].output[0])
 
-# nnsight.save() is preferred because:
-# - Works on any object (including those with their own .save() method)
-# - Doesn't require the pymount C extension
-# - More explicit about what's happening
+# ALSO WORKS: obj.save() — backwards-compatible method form
+output = model.transformer.h[-1].output[0].save()
 ```
+
+**Always use `nnsight.save()` for non-tensor values** like shape integers, lists, or dicts. The `obj.save()` method form relies on a C extension (pymount) that injects `.save()` onto every Python object at runtime. It exists for backwards compatibility with NNsight 0.4 code, but `nnsight.save()` is safer because it works even on objects that define their own `.save()` method (which would shadow NNsight's version). See [NNsight.md § 5.1](./NNsight.md) for implementation details.
 
 ---
 
@@ -834,12 +832,16 @@ model.clear_edits()
 Get shapes and types without running the full model:
 
 ```python
+import nnsight
+
 with model.scan("Hello"):
-    # Access shape information
-    dim = model.transformer.h[0].output[0].shape[-1]
-    
+    # Access shape information - must use .save() to persist outside the context
+    dim = nnsight.save(model.transformer.h[0].output[0].shape[-1])
+
 print(dim)  # e.g., 768
 ```
+
+**Important:** Even though `model.scan()` uses fake tensors for lightweight execution, it is still a tracing context. You **must** use `.save()` (or `nnsight.save()`) on any value you want to access after the `with model.scan(...)` block exits. This is the same rule as `model.trace()` — values defined inside the context are garbage collected unless explicitly saved. Use `nnsight.save()` for non-tensor values like shape integers.
 
 ### Validation Mode
 
@@ -1293,14 +1295,20 @@ with model.trace("Hello"):
 
 ### Activation Patching
 
+**Important:** When both invokes access the same module (here `transformer.h[5]`), you **must** use a barrier to synchronize them. Without the barrier, `clean_hs` will not be defined when the second invoke tries to use it.
+
 ```python
 with model.trace() as tracer:
+    barrier = tracer.barrier(2)  # Synchronize 2 invokes
+
     # Clean run
     with tracer.invoke("The Eiffel Tower is in"):
-        clean_hs = model.transformer.h[5].output[0][:, -1, :].save()
-    
+        clean_hs = model.transformer.h[5].output[0][:, -1, :]
+        barrier()  # Signal: clean_hs is now available
+
     # Patched run
     with tracer.invoke("The Colosseum is in"):
+        barrier()  # Wait until invoke 1 has materialized clean_hs
         model.transformer.h[5].output[0][:, -1, :] = clean_hs
         patched_logits = model.lm_head.output.save()
 ```
@@ -1489,11 +1497,12 @@ with model.trace("Hello"):
     print(shape)  # torch.Size([1, 5, 768])
 ```
 
-Use `.scan()` if you need shapes **without** running the model:
+Use `.scan()` if you need shapes **without** running the model (remember to save values you need outside the context):
 
 ```python
+import nnsight
 with model.scan("Hello"):
-    shape = model.transformer.h[0].output[0].shape  # Shape via fake tensors
+    shape = nnsight.save(model.transformer.h[0].output[0].shape)  # Shape via fake tensors
 ```
 
 ### 8. Generation vs Trace
@@ -1516,6 +1525,50 @@ with model.trace("Hello"):
     device = model.transformer.h[0].output[0].device
     noise = torch.randn(768).to(device)  # Match device!
     model.transformer.h[0].output[0][:, -1, :] += noise
+```
+
+### 10. Cross-Invoke Same-Module Access Requires Barriers
+
+When two invokes **both access the same module** (e.g., both read `transformer.h[5].output`), you **must** use a barrier. Without it, the variable captured in invoke 1 will not be materialized when invoke 2 tries to use it, resulting in a `NameError`.
+
+```python
+# WRONG - clean_hs is not defined when invoke 2 runs
+with model.trace() as tracer:
+    with tracer.invoke("Hello"):
+        clean_hs = model.transformer.h[5].output[0][:, -1, :]
+    with tracer.invoke("World"):
+        model.transformer.h[5].output[0][:, -1, :] = clean_hs  # NameError!
+        logits = model.lm_head.output.save()
+
+# CORRECT - barrier synchronizes the invokes
+with model.trace() as tracer:
+    barrier = tracer.barrier(2)
+    with tracer.invoke("Hello"):
+        clean_hs = model.transformer.h[5].output[0][:, -1, :]
+        barrier()  # Invoke 1 waits here after materializing clean_hs
+    with tracer.invoke("World"):
+        barrier()  # Invoke 2 waits until invoke 1 has passed its barrier
+        model.transformer.h[5].output[0][:, -1, :] = clean_hs  # Now available
+        logits = model.lm_head.output.save()
+```
+
+**Rule of thumb:** If two invokes access `.output` or `.input` on the same module and you want to share a value between them, always use a barrier.
+
+### 11. `.save()` Is Required in All Tracing Contexts (Including Scan)
+
+`.save()` is needed to persist values outside **any** tracing context — this includes `model.trace()`, `model.generate()`, `model.session()`, **and** `model.scan()`. Even though scan uses fake tensors for lightweight execution, it is still a tracing context that garbage-collects unsaved values.
+
+```python
+# WRONG - dim is lost after scan exits
+with model.scan("Hello"):
+    dim = model.transformer.h[0].output[0].shape[-1]
+print(dim)  # Error or undefined
+
+# CORRECT - use nnsight.save() for non-tensor values like ints
+import nnsight
+with model.scan("Hello"):
+    dim = nnsight.save(model.transformer.h[0].output[0].shape[-1])
+print(dim)  # 768
 ```
 
 ---

@@ -802,15 +802,18 @@ def output(self, value):
 When using `.scan()` (shape inference without full execution), fake inputs/outputs are populated:
 
 ```python
+import nnsight
+
 with model.scan("Hello"):
     # Runs with fake tensors, populates _fake_output
-    shape = model.transformer.h[0].output[0].shape
+    # To persist a value outside the scan, use .save() or nnsight.save()
+    shape = nnsight.save(model.transformer.h[0].output[0].shape)
 
-# After scanning, can access outside trace
+# After scanning, can also access _fake_output directly on the module
 print(model.transformer.h[0]._fake_output.shape)
 ```
 
-The `_fake_output` and `_fake_inputs` attributes store these fake values, allowing access outside a trace after scanning.
+The `_fake_output` and `_fake_inputs` attributes store these fake values on the module, allowing access outside a trace after scanning. Note that regular variables defined inside `.scan()` still require `.save()` to persist, just like any other tracing context.
 
 ---
 
@@ -1264,37 +1267,24 @@ with model.trace("Hello"):
 print(hidden)  # Error! hidden is no longer valid
 ```
 
-#### The Solution: `.save()`
+#### How Saving Works
+
+Under the hood, saving is simple. A global set (`Globals.saves`) tracks which objects should persist. The save function just adds the object's `id()` to that set and returns the object unchanged:
 
 ```python
-with model.trace("Hello"):
-    hidden = model.transformer.h[0].output[0].save()  # Mark for persistence
-
-print(hidden)  # Works! hidden contains the saved tensor
+# From globals.py — this is the entire mechanism
+def save(object: Any):
+    Globals.saves.add(id(object))
+    return object
 ```
 
-#### Implementation: Pymounting
+When the trace exits, any object whose `id()` is in this set is kept; everything else is garbage collected.
 
-NNsight uses a C extension (`py_mount.c`) to add `.save()` to Python's base `object` class. This allows calling `.save()` on any value:
+#### Two Ways to Save
 
-```c
-// From py_mount.c
-static PyObject* mount_function(PyObject* self, PyObject* args) {
-    // ...
-    PyObject *dict = get_dict(&PyBaseObject_Type);
-    PyDict_SetItemString(dict, mount_point, method);
-    PyType_Modified(&PyBaseObject_Type);
-    // ...
-}
-```
+There are two equivalent APIs that both call the same underlying function:
 
-This mounts the `save` function directly onto `PyBaseObject_Type`, making it available on all Python objects.
-
-**Limitation:** Objects that already define `.save()` (like some PyTorch classes) won't use NNsight's version.
-
-#### The Preferred Alternative: `nnsight.save()`
-
-For objects that already have `.save()`, or when pymounting is disabled:
+**1. `nnsight.save(obj)` — the standalone function (preferred)**
 
 ```python
 import nnsight
@@ -1305,16 +1295,59 @@ with model.trace("Hello"):
 print(hidden)  # Works
 ```
 
+This is a plain function call. It works on any object (tensors, ints, lists, dicts, etc.) regardless of configuration or whether the object has its own `.save()` method.
+
+**2. `obj.save()` — the method form (backwards compatibility)**
+
+```python
+with model.trace("Hello"):
+    hidden = model.transformer.h[0].output[0].save()
+
+print(hidden)  # Works
+```
+
+This is syntactically convenient, but making it work requires an unusual mechanism: Python objects don't normally have a `.save()` method. NNsight adds one at runtime using a C extension.
+
+#### Implementation: Pymount (Why `obj.save()` Exists)
+
+In NNsight 0.4 and earlier, `.save()` was the only API for persisting values, and it was central to every example and tutorial. When NNsight 0.5 introduced the new thread-based architecture, we needed to maintain backwards compatibility with all existing code that used `obj.save()`.
+
+The challenge: `.save()` must work on **any** Python object — not just tensors, but also ints (`shape[-1].save()`), lists (`list().save()`), and arbitrary values. Python doesn't let you add methods to `object` at the Python level, so NNsight uses a **C extension** (`py_mount.c`) that directly modifies CPython's type system:
+
+```c
+// From py_mount.c — injects a method onto every Python object
+static PyObject* mount_function(PyObject* self, PyObject* args) {
+    // ...
+    // Add the method to PyBaseObject_Type (the C-level `object` type)
+    PyObject *dict = get_dict(&PyBaseObject_Type);
+    PyDict_SetItemString(dict, mount_point, method);
+    PyType_Modified(&PyBaseObject_Type);
+    // ...
+}
+```
+
+This modifies `PyBaseObject_Type->tp_dict` — the dictionary of Python's base `object` class — at the C level. Since every Python type inherits from `object`, this makes `.save()` available on every object in the interpreter.
+
+**Lifecycle:** The method is only mounted while a trace is active. `Globals.enter()` calls `mount(Object.save, "save")` when the first trace starts, and `Globals.exit()` calls `unmount("save")` when the last trace exits. A `stack` counter handles nesting, so the method stays mounted through nested traces and is only removed when all traces have exited.
+
+**Limitations of pymount:**
+
+- **Method shadowing:** Objects that already define their own `.save()` method (like some PyTorch classes) will use their own version, not NNsight's. This can cause silent bugs where `.save()` appears to work but doesn't actually mark the value for persistence.
+- **Global mutation:** It modifies the type system for the entire Python interpreter, not just NNsight code.
+- **C extension dependency:** Requires the compiled `py_mount.c` extension to be available.
+
+#### Which to Use
+
+**Prefer `nnsight.save()`** — it is a plain function call with no special machinery, works on all objects regardless of whether they define their own `.save()`, and doesn't depend on the pymount C extension. `obj.save()` exists for backwards compatibility with NNsight 0.4 code.
+
 #### Configuration
 
-Pymounting has some performance cost and can be disabled:
+Pymount can be disabled if you exclusively use `nnsight.save()`:
 
 ```python
 from nnsight import CONFIG
 CONFIG.APP.PYMOUNT = False  # Disable obj.save(), use nnsight.save() instead
 ```
-
-The `.save()` method was added primarily for backwards compatibility with NNsight 0.4. New code can use either approach.
 
 ---
 
@@ -1750,35 +1783,45 @@ Barriers synchronize execution across multiple invokes.
 
 #### The Problem
 
-With multiple invokes, each runs as a separate thread. Sometimes you need to:
+With multiple invokes, each runs as a separate thread. When **both invokes access the same module** (e.g., both read `transformer.h[5].output`), the variable captured in invoke 1 will not be available to invoke 2 without explicit synchronization. This results in a `NameError` at runtime.
 
-1. Wait for one invoke to complete something before another proceeds
-2. Share a value from invoke 1 to invoke 2 at a specific point
+```python
+# BROKEN - both invokes access transformer.h[1], clean_hs is undefined in invoke 2
+with model.trace() as tracer:
+    with tracer.invoke("Hello"):
+        clean_hs = model.transformer.h[1].output[0]
 
-While cross-invoker variable sharing (push/pull) handles simple cases, barriers provide explicit synchronization points.
+    with tracer.invoke("World"):
+        model.transformer.h[1].output[0] = clean_hs  # NameError: clean_hs is not defined
+```
+
+#### When Barriers Are Required
+
+**Rule:** If two invokes access `.output` or `.input` on the **same module** and you want to share a value between them, you must use a barrier.
 
 #### Usage
 
-Consider replacing layer 1's output in invoke 2 with invoke 1's value:
+Use `tracer.barrier(n)` to create a barrier for `n` participants. Each invoke calls `barrier()` at the synchronization point. The barrier ensures all participants have reached their barrier call before any proceed past it.
 
 ```python
 with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        layer1_out = model.transformer.h[1].output[0]  # Invoke 1 gets value
-        # Barrier: wait here until invoke 2 is ready
-    
-    with tracer.invoke("World"):
-        # Invoke 2 needs layer1_out, but it's not available yet
-        model.transformer.h[1].output[0] = layer1_out
-```
+    barrier = tracer.barrier(2)  # Create barrier for 2 invokes
 
-The problem: invoke 1's `layer1_out` isn't available until invoke 1 reaches layer 1. But invoke 2 might try to use it at layer 0.
+    with tracer.invoke("Hello"):
+        clean_hs = model.transformer.h[1].output[0]
+        barrier()  # Invoke 1 waits here - clean_hs is now materialized
+
+    with tracer.invoke("World"):
+        barrier()  # Invoke 2 waits until invoke 1 has passed its barrier
+        model.transformer.h[1].output[0] = clean_hs  # Now available!
+        output = model.lm_head.output.save()
+```
 
 Barriers ensure the correct ordering by:
 
-1. Invoke 2 requests a barrier at a specific provider
-2. When that provider is reached, invoke 1 is resumed to provide the value
-3. Invoke 2 then continues with the value available
+1. Invoke 1 captures the value and calls `barrier()`, signaling it has materialized the variable
+2. Invoke 2 calls `barrier()`, which blocks until invoke 1 has also reached its barrier
+3. After both have synchronized, invoke 2 proceeds with the shared variable now available
 
 #### Implementation
 
@@ -1799,13 +1842,18 @@ def handle_barrier_event(self, provider, participants):
 
 Scanning runs the model with **fake tensors** to determine shapes and validate interventions without full execution.
 
+**Important:** `model.scan()` is a tracing context, so `.save()` is still required to persist values outside the block. Use `nnsight.save()` for non-tensor values like shape integers.
+
 #### Usage
 
 ```python
+import nnsight
+
 with model.scan("Hello"):
     # Access shapes without running real computation
-    dim = model.transformer.h[0].output[0].shape[-1]
-    
+    # Must use .save() to persist values outside the scan context
+    dim = nnsight.save(model.transformer.h[0].output[0].shape[-1])
+
     # Validate slicing
     model.transformer.h[0].output[0][:, 10] = 0  # Will fail if seq_len < 11
 
@@ -3051,7 +3099,6 @@ ValueError: Cannot return output of Envoy that is not interleaving nor has a fak
 
 **Common causes:**
 1. `.trace()` called with no input and no invokes
-2. `.trace()` called with only keyword arguments (base `NNsight` requires positional args)
 
 **Fix:** Provide input to `.trace(input)` or use `.invoke()`:
 

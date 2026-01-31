@@ -293,11 +293,13 @@ assert torch.all(out2 == 0)
 
 ## Scanning (Shape Inference)
 
-Get shapes without running the full model:
+Get shapes without running the full model. Like all tracing contexts, `.save()` is required to persist values outside the block:
 
 ```python
+import nnsight
+
 with model.scan("Hello"):
-    dim = model.transformer.h[0].output[0].shape[-1]
+    dim = nnsight.save(model.transformer.h[0].output[0].shape[-1])
 
 print(dim)  # 768
 ```
