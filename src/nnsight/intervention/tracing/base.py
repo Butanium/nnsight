@@ -275,7 +275,13 @@ class Tracer:
             if not source_lines[-1].endswith("\n"):
                 source_lines[-1] += "\n"
 
-        # CASE 3: Regular Python file
+        # CASE 3: Command line
+        elif "-c" in sys.orig_argv:
+            source_lines = sys.orig_argv[sys.orig_argv.index("-c") + 1].splitlines(
+                keepends=True
+            )
+
+        # CASE 4: Regular Python file
         elif not frame.f_code.co_filename.startswith("<nnsight"):
 
             def noop(*args, **kwargs):
