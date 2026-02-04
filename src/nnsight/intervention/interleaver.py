@@ -140,7 +140,7 @@ class Interleaver:
         Returns:
             str: The updated provider string
 
-        Example:
+        Examples:
             >>> provider = "model.transformer.h[0].input"
             >>> iterate_provider(provider)
             "model.transformer.h[0].input.i0"

@@ -40,7 +40,7 @@ def register(module: types.ModuleType | str):
         - The module's source code and definitions will be included in the serialized
           payload, so keep registered modules reasonably sized.
 
-    Example:
+        Examples:
         >>> import mymodule
         >>> from nnsight import LanguageModel
         >>> from nnsight.ndif import register
@@ -80,7 +80,7 @@ class NdifStatus(dict):
     Attributes:
         status: The overall service status (UP, REDEPLOYING, or DOWN).
 
-    Example:
+        Examples:
         >>> from nnsight import ndif_status
         >>> status = ndif_status()
         >>> print(status)  # Displays a formatted table of all models
@@ -261,7 +261,7 @@ def status(raw: bool = False) -> Union[dict, NdifStatus]:
         If raw=False: An NdifStatus object with formatted model information,
             or an empty dict if the request fails.
 
-    Example:
+        Examples:
         >>> from nnsight import ndif_status
         >>> status = ndif_status()
         >>> print(status)
@@ -335,7 +335,7 @@ def is_model_running(repo_id: str, revision: str = "main") -> bool:
         True if the model is running and available, False otherwise
         (including if the API request fails).
 
-    Example:
+        Examples:
         >>> from nnsight import is_model_running
         >>> if is_model_running("meta-llama/Llama-3.1-70B"):
         ...     print("Model is available!")

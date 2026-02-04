@@ -146,10 +146,10 @@ class Envoy(Batchable):
         This property allows access to the return values produced by the module
         during the forward pass.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     attn = model.transformer.h[0].attn.output[0].save()
+            ...     attn = model.transformer.h[0].attn.output[0].save()
             >>> print(attn)
 
         Returns:
@@ -175,10 +175,10 @@ class Envoy(Batchable):
         This allows for intervention by replacing the module's output with
         custom values during execution.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     model.transformer.h[0].attn.output[0] *= 2
+            ...     model.transformer.h[0].attn.output[0] *= 2
 
         Args:
             value: The new output value to use.
@@ -200,10 +200,10 @@ class Envoy(Batchable):
         This property provides access to all input values passed to the module
         during the forward pass.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     args, kwargs = model.transformer.h[0].attn.inputs
+            ...     args, kwargs = model.transformer.h[0].attn.inputs
 
         Returns:
             The module's input values as a tuple of positional and keyword arguments. i.e (args, kwargs)
@@ -230,10 +230,10 @@ class Envoy(Batchable):
         This allows for intervention by replacing the module's inputs with
         custom values during execution.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     model.transformer.h[0].attn.inputs = (torch.randn(1, 1024, 1024), {})
+            ...     model.transformer.h[0].attn.inputs = (torch.randn(1, 1024, 1024), {})
 
         Args:
             value: The new input value(s) to use, structured as a tuple of (args, kwargs)
@@ -254,10 +254,10 @@ class Envoy(Batchable):
         This is a convenience property that returns just the first input value
         from all inputs passed to the module. So first positional argument, or first keyword argumetn if there are no positional arguments.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     hidden_states = model.transformer.h[0].attn.input.save()
+            ...     hidden_states = model.transformer.h[0].attn.input.save()
             >>> print(hidden_states)
 
         Returns:
@@ -276,10 +276,10 @@ class Envoy(Batchable):
         This is a convenience method that replaces just the first input value
         while preserving all other inputs.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     model.transformer.h[0].attn.input = torch.randn(1, 1024, 1024)
+            ...     model.transformer.h[0].attn.input = torch.randn(1, 1024, 1024)
 
         Args:
             value: The new value for the first input
@@ -299,8 +299,7 @@ class Envoy(Batchable):
         This property provides access to the module's source code with operations
         highlighted, allowing for inspection and intervention at specific points.
 
-        Example:
-
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
 
             >>> # We can print to see the formward method of the module and names associated with the operations within.
@@ -354,8 +353,8 @@ class Envoy(Batchable):
                  ....
 
             >>> with model.trace("Hello World"):
-            >>>     # Now we can access it like we would any other Envoy with .input or .output to grab the intermediate value.
-            >>>     attn = model.transformer.h[0].attn.source.attention_interface_0.output.save()
+            ...     # Now we can access it like we would any other Envoy with .input or .output to grab the intermediate value.
+            ...     attn = model.transformer.h[0].attn.source.attention_interface_0.output.save()
 
             >>> print(attn)
 
@@ -417,12 +416,12 @@ class Envoy(Batchable):
         This method returns a tracer that can be used to capture and modify
         the execution of the module.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     model.transformer.h[0].attn.output[0][:] = 0
+            ...     model.transformer.h[0].attn.output[0][:] = 0
 
-            >>>     output = model.output.save()
+            ...     output = model.output.save()
             >>> print(output)
 
         Args:
@@ -455,15 +454,15 @@ class Envoy(Batchable):
 
         Note this will not dispatch the model if not dispatched.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> # Value error as the fake inputs and outputs have not been scanned in.
             >>> print(model.transformer.h[0].mlp.output.shape)
             >>> # Scan the model to validate operations and inspect shapes
             >>> with model.scan("Hello World"):
-            >>>     # Access fake inputs/outputs to inspect shapes
-            >>>     attn_input = model.transformer.h[0].attn.input.save()
-            >>>     attn_output = model.transformer.h[0].attn.output[0].save()
+            ...     # Access fake inputs/outputs to inspect shapes
+            ...     attn_input = model.transformer.h[0].attn.input.save()
+            ...     attn_output = model.transformer.h[0].attn.output[0].save()
             >>> print(f"Attention input shape: {attn_input.shape}")
             >>> print(f"Attention output shape: {attn_output.shape}")
             >>> print(model.transformer.h[0].mlp.output.shape)
@@ -484,20 +483,20 @@ class Envoy(Batchable):
 
         Edits can be cleared with `Envoy.clear_edits()`.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> # Now the first layer attention output will always be 0.
             >>> with model.edit() as edited_model:
-            >>>     edited_model.transformer.h[0].attn.output[:] = 0
+            ...     edited_model.transformer.h[0].attn.output[:] = 0
 
 
             >>> with model.trace("Hello World"):
-            >>>     output = model.output.save()
+            ...     output = model.output.save()
             >>> # The orignal model will have the default output.
             >>> print(output)
 
             >>> with edited_model.trace("Hello World"):
-            >>>     edited_output = edited_model.output.save()
+            ...     edited_output = edited_model.output.save()
             >>> # The edited model will have the output after our intervention.
             >>> print(edited_output)
 
@@ -602,12 +601,12 @@ class Envoy(Batchable):
         """Skips the execution of this module duting execution / interleaving.
         Behavior is the module will not be executed and will return a replacement value instead.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.trace("Hello World"):
-            >>>     # Skip the first layer and replace it with the input to the layer.
-            >>>     model.transformer.h[0].skip((model.transformer.h[0].input, None))
-            >>>     output = model.output.save()
+            ...     # Skip the first layer and replace it with the input to the layer.
+            ...     model.transformer.h[0].skip((model.transformer.h[0].input, None))
+            ...     output = model.output.save()
             >>> print(output)
 
         Args:
@@ -1435,9 +1434,9 @@ class Aliaser:
 
         Args:
             rename (Dict[str, Union[str, List[str]]]): Dictionary mapping module names to alias names.
-                Example: {"layer1": "first_layer", "layer2": "second_layer"}
-                Example: {".model.layers": ".layers"} <-- Mounts .layers to the root model.
-                Example: {".transformer": ["model", "mdl"]} <-- Allows access of .transformer as .model or .mdl
+                Examples: {"layer1": "first_layer", "layer2": "second_layer"}
+                Examples: {".model.layers": ".layers"} <-- Mounts .layers to the root model.
+                Examples: {".transformer": ["model", "mdl"]} <-- Allows access of .transformer as .model or .mdl
 
         Attributes:
             rename (Dict[str, Union[str, List[str]]]): Dictionary mapping module names to alias names.

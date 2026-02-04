@@ -20,11 +20,11 @@ class Object(torch.Tensor):
         """
         Save an object to be accessable after the trace context is exited.
 
-        Example:
+        Examples:
 
         >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
         >>> with model.trace("Hello World"):
-        >>>     attn_0 = model.transformer.h[0].attn.output.save()
+        ...     attn_0 = model.transformer.h[0].attn.output.save()
         >>> print(attn_0)
         """
 

@@ -24,7 +24,7 @@ Persistent objects:
     but instead referenced by ID and resolved at deserialization time. Objects
     with a `_persistent_id` attribute in their __dict__ are handled this way.
 
-Example:
+Examples:
     >>> import serialization
     >>> def my_func(x, y=10):
     ...     return x + y
@@ -640,7 +640,7 @@ class CustomCloudPickler(cloudpickle.Pickler):
         - Persistent object references via persistent_id for objects that
           shouldn't be fully serialized
 
-    Example:
+    Examples:
         >>> import io
         >>> def my_func(x):
         ...     return x * 2
@@ -850,7 +850,7 @@ class CustomCloudPickler(cloudpickle.Pickler):
             The persistent ID if obj has a `_persistent_id` in its __dict__,
             otherwise None (meaning pickle should serialize normally).
 
-        Example:
+        Examples:
             An object with obj.__dict__["_persistent_id"] = "node_42" will be
             serialized as just the reference "node_42", and during deserialization,
             persistent_load("node_42") will be called to resolve it.
@@ -881,7 +881,7 @@ class CustomCloudUnpickler(pickle.Unpickler):
             When a persistent ID is encountered during deserialization, it's
             looked up in this dictionary.
 
-    Example:
+    Examples:
         >>> # On the server side
         >>> model_proxy = get_model_proxy("gpt2")
         >>> persistent_objects = {"model_ref_1": model_proxy}
@@ -946,7 +946,7 @@ def dumps(
         If path is None: The serialized data as bytes.
         If path is provided: None (data is written to file).
 
-    Example:
+    Examples:
         >>> # Serialize to bytes (for network transmission)
         >>> data = dumps(my_function)
         >>> send_to_server(data)
@@ -999,7 +999,7 @@ def loads(
             in the persistent_objects dictionary.
         FileNotFoundError: If a file path is provided but the file doesn't exist.
 
-    Example:
+    Examples:
         >>> # Load from bytes (received over network)
         >>> data = receive_from_client()
         >>> obj = loads(data)

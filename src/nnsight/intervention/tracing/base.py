@@ -59,7 +59,7 @@ class Tracer:
     3. **Compile**: Wraps the source code in a function definition for execution
     4. **Execute**: Runs the compiled function with appropriate context
 
-    Example:
+        Examples:
         ```python
         with Tracer() as tracer:
             # This code block will be captured and executed later

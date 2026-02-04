@@ -28,7 +28,7 @@ Modes of operation:
     - Non-blocking: Submit and poll for results separately
     - Async: Asyncio-compatible versions of blocking operations
 
-Example:
+        Examples:
     >>> from nnsight import NNsight
     >>> model = NNsight(model_key="openai-community/gpt2")
     >>> with model.trace("Hello", remote=True):

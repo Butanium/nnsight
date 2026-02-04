@@ -8,11 +8,6 @@ from ...intervention.tracing.tracer import ScanningTracer
 from .. import NNsight
 from .loadable import LoadableMixin
 
-if TYPE_CHECKING:
-    from ...intervention.interleaver import Interleaver
-else:
-    Interleaver = Any
-
 
 class MetaMixin(LoadableMixin):
 

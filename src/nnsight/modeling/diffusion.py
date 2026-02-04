@@ -60,9 +60,13 @@ class DiffusionModel(HuggingFaceModel):
 
         return model
 
-    def _load(self, repo_id: str, revision: Optional[str] = None, device_map=None, **kwargs) -> Diffuser:
+    def _load(
+        self, repo_id: str, revision: Optional[str] = None, device_map=None, **kwargs
+    ) -> Diffuser:
 
-        model = Diffuser(self.automodel, repo_id, revision=revision, device_map=device_map, **kwargs)
+        model = Diffuser(
+            self.automodel, repo_id, revision=revision, device_map=device_map, **kwargs
+        )
 
         return model
 
@@ -74,7 +78,7 @@ class DiffusionModel(HuggingFaceModel):
         if isinstance(inputs, str):
             inputs = [inputs]
 
-        return ((inputs,), {})
+        return (inputs,), {}, len(inputs)
 
     def _batch(
         self,

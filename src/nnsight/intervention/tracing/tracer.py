@@ -542,10 +542,10 @@ class InterleavingTracer(Tracer):
 
         This property allows access to the return values produced by the method being traced.
 
-        Example:
+        Examples:
             >>> model = LanguageModel("gpt2", device_map='auto', dispatch=True)
             >>> with model.generate("Hello World") as tracer:
-            >>>     result = tracer.result.save()
+            ...     result = tracer.result.save()
             >>> print(result)
 
         Returns:
