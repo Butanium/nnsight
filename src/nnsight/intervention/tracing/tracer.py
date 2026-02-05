@@ -319,6 +319,12 @@ class InterleavingTracer(Tracer):
 
         super().__init__(*args, **kwargs, backend=backend)
 
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = super().__exit__(exc_type, exc_value, traceback)
+        del self.model
+        del self.fn
+        return result
+
     def capture(self):
         """
         Capture the code block within the 'with' statement.

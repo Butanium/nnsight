@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import types
 import warnings
+import weakref
 from collections import defaultdict
 from enum import Enum
 from functools import wraps
@@ -205,28 +207,33 @@ class Interleaver:
             None
         """
 
-        forward = module.forward
-
         # Check if already wrapped with skippable forward
-        pre_wrapped = hasattr(forward, "__nnsight_original_forward__")
+        pre_wrapped = hasattr(module, "__nnsight_skip__")
 
         if not pre_wrapped:
             # First time wrapping - create skippable forward wrapper
-            @wraps(forward)
-            def nnsight_forward(*args, **kwargs):
 
+            original_forward = type(module).forward
+            module.__nnsight_skip__ = [None]
+            skip_container = module.__nnsight_skip__
+
+            # Use weakref to avoid reference cycle:
+            # module -> forward -> __self__ -> module
+            module_ref = weakref.ref(module)
+
+            @wraps(original_forward)
+            def nnsight_forward(*args, **kwargs):
+                m = module_ref()
                 if skip_container[0] is not None:
                     # Skip is set, return the skip value
                     # (will be cleared by output hook)
                     return skip_container[0]
 
-                return forward(*args, **kwargs)
+                return original_forward(m, *args, **kwargs)
 
             module.forward = nnsight_forward
-            nnsight_forward.__nnsight_original_forward__ = forward
-            module.__nnsight_skip__ = [None]
-
-        skip_container = module.__nnsight_skip__
+        else:
+            skip_container = module.__nnsight_skip__
 
         # Hook the module's input to intercept and interleave the input values.
         # Each interleaver adds its own hooks; they coexist and each checks its own interleaving state.
