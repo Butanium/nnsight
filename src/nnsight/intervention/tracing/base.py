@@ -693,6 +693,8 @@ class Tracer:
 
             self.backend(self)
 
+            self.info = None
+
             return True
 
     async def __aenter__(self):
