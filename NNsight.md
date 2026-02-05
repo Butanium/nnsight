@@ -81,6 +81,16 @@ This document provides an overview of the design choices and implementation deta
    - [Print Statements and Logging](#811-print-statements-and-logging)
    - [Implementation Details](#812-implementation-details)
 9. [Extending NNsight](#9-extending-nnsight) *(coming soon)*
+10. [Performance](#10-performance)
+    - [Overhead Summary](#101-overhead-summary)
+    - [Detailed Overhead Breakdown](#102-detailed-overhead-breakdown)
+    - [Where the Overhead Comes From](#103-where-the-overhead-comes-from)
+    - [Configuration Options](#104-configuration-options)
+    - [Configuration Comparison](#105-configuration-comparison)
+    - [NNsight vs PyTorch Hooks](#106-nnsight-vs-pytorch-hooks)
+    - [Performance Best Practices](#107-performance-best-practices)
+    - [When NNsight Makes Sense](#108-when-nnsight-makes-sense)
+    - [Profiling Your Own Code](#109-profiling-your-own-code)
 
 ---
 
@@ -3840,3 +3850,354 @@ The entire session is serialized as one intervention, executed sequentially on t
 
 *Coming soon!*
 
+
+---
+
+---
+
+## 10. Performance
+
+NNsight adds overhead compared to raw PyTorch hooks, but this is the cost of its declarative syntax and powerful features. This section provides detailed performance analysis to help you understand and optimize NNsight's behavior.
+
+---
+
+### 10.1 Overhead Summary
+
+| Component | Overhead | Notes |
+|-----------|----------|-------|
+| **Fixed per-trace** | ~2.5ms | Source capture, AST parsing, compilation, threading |
+| **Per-intervention** | ~0.2ms | Marginal additional cost per `.save()` |
+| **LanguageModel overhead** | ~1.25x | 25% overhead for typical generation |
+| **Trace caching speedup** | 1.09-1.15x | When `TRACE_CACHING=True` |
+
+**Key insight:** The majority of NNsight overhead is **fixed per-trace** (~2.5ms), not per-intervention. This means:
+- Small traces are proportionally expensive
+- Large traces (many interventions) amortize the fixed cost well
+- Prefer many interventions in one trace over multiple small traces
+
+---
+
+### 10.2 Detailed Overhead Breakdown
+
+#### Core Timing Results
+
+```
+Component                    Time (ms)    Notes
+─────────────────────────────────────────────────────
+Model baseline (forward)     0.594        Simple Linear model
+NNsight wrapper creation     0.967        One-time cost
+Empty trace overhead         2.975        Fixed per-trace cost
+Single intervention          3.172        +0.2ms over empty trace
+Six interventions            3.387        +0.07ms average each
+```
+
+#### LanguageModel (GPT-2) Results
+
+```
+Operation                    Time (ms)    Ratio
+─────────────────────────────────────────────────────
+Baseline generation          28.98        1.00x
+NNsight generation           36.09        1.25x
+─────────────────────────────────────────────────────
+Overhead                     7.11         24.5%
+Per-layer intervention       0.21         Marginal
+```
+
+For real-world language model usage, NNsight adds only **25% overhead**, which is excellent for an interpretability tool.
+
+#### Scaling Behavior
+
+As you add more interventions, the overhead scales linearly but with a very small per-intervention cost:
+
+![Intervention Scaling](./tests/performance/results/interventions_scaling.png)
+
+*Figure: NNsight overhead scales linearly with intervention count. The fixed ~2.5ms cost dominates for small numbers of interventions.*
+
+---
+
+### 10.3 Where the Overhead Comes From
+
+#### Tracing Phase (~0.5ms)
+
+```
+Operation                    Time (ms)    % of Trace
+─────────────────────────────────────────────────────
+inspect.getsourcelines()     0.185        7.3%
+AST parsing                  0.152        6.0%
+Code compilation             0.151        6.0%
+─────────────────────────────────────────────────────
+Total parsing overhead       0.488        19.3%
+```
+
+**Why this is required:** Unlike simple hooks, NNsight captures and parses your intervention code:
+
+```python
+with model.trace(input):
+    # NNsight captures this source code
+    # Parses it to find the with-block boundaries
+    # Compiles and transforms it for interleaved execution
+    hidden = model.layer.output.save()
+```
+
+This is fundamental to how NNsight works—it's not optional overhead. The benefit is the clean, Pythonic syntax that enables features like cross-invocation variable sharing and automatic batching.
+
+#### Threading Phase (~0.3ms)
+
+```
+Operation                    Time (ms)    Frequency
+─────────────────────────────────────────────────────
+Thread creation              0.045        Per trace
+Thread start                 0.274        Per trace
+─────────────────────────────────────────────────────
+Total threading overhead     0.319        Per trace
+```
+
+Threading enables NNsight's interleaving model where intervention code runs alongside model execution, synchronized at each module boundary.
+
+---
+
+### 10.4 Configuration Options
+
+NNsight provides several configuration options that affect performance. Access them via `CONFIG.APP`:
+
+```python
+from nnsight import CONFIG
+
+# View current settings
+print(CONFIG.APP)
+```
+
+#### TRACE_CACHING
+
+Caches compiled trace contexts for reuse when running the same trace multiple times.
+
+```python
+CONFIG.APP.TRACE_CACHING = True  # Default: False
+```
+
+| Setting | Time (ms) | Improvement |
+|---------|-----------|-------------|
+| `False` | 2.832 | Baseline |
+| `True` | 2.598 | **1.09x faster** |
+
+**Recommendation:** Enable for any experiment that runs the same trace structure repeatedly (e.g., iterating over different inputs with the same intervention logic).
+
+```python
+from nnsight import CONFIG
+CONFIG.APP.TRACE_CACHING = True
+
+# All these traces benefit from caching
+for prompt in prompts:
+    with model.trace(prompt):
+        hidden = model.transformer.h[5].output.save()
+```
+
+#### CROSS_INVOCATION_CACHING
+
+Enables sharing variables between different invokes within the same trace.
+
+```python
+CONFIG.APP.CROSS_INVOCATION_CACHING = True  # Default: True
+```
+
+| Setting | Time (ms) | Impact |
+|---------|-----------|--------|
+| `False` | 3.132 | Baseline |
+| `True` | 3.615 | **+0.48ms** |
+
+**Recommendation:** Disable if you don't need to share variables across invokes:
+
+```python
+from nnsight import CONFIG
+
+# If you DON'T need cross-invoke sharing:
+CONFIG.APP.CROSS_INVOCATION_CACHING = False
+
+with model.trace() as tracer:
+    with tracer.invoke("Hello"):
+        out1 = model.output.save()
+    with tracer.invoke("World"):
+        out2 = model.output.save()  # Can't reference out1 here
+```
+
+#### PYMOUNT
+
+Controls whether `.save()` method is mounted on all Python objects.
+
+```python
+CONFIG.APP.PYMOUNT = True  # Default: True
+```
+
+When enabled, you can use `obj.save()` syntax. When disabled, use `nnsight.save(obj)` instead:
+
+```python
+from nnsight import CONFIG, save
+
+CONFIG.APP.PYMOUNT = False
+
+with model.trace("Hello"):
+    # Use function form instead of method form
+    hidden = save(model.transformer.h[0].output)
+```
+
+**Performance impact:** Minimal, but disabling removes the C extension overhead of mounting/unmounting the method.
+
+---
+
+### 10.5 Configuration Comparison
+
+Different configuration combinations have different performance characteristics:
+
+![Configuration Comparison](./tests/performance/results/config_comparison.png)
+
+*Figure: Performance impact of different NNsight configurations. Trace caching provides consistent speedup; cross-invocation caching adds overhead but enables powerful features.*
+
+#### Optimal Configurations by Use Case
+
+| Use Case | TRACE_CACHING | CROSS_INVOCATION_CACHING | Notes |
+|----------|---------------|--------------------------|-------|
+| **Production/Experiments** | `True` | As needed | Best performance for repeated traces |
+| **Development/Debugging** | `False` | `True` | Easier debugging, full features |
+| **Maximum Performance** | `True` | `False` | When not sharing across invokes |
+| **Remote Execution** | `True` | `True` | Full features for NDIF |
+
+---
+
+### 10.6 NNsight vs PyTorch Hooks
+
+NNsight adds significant overhead compared to raw PyTorch hooks, but provides substantial productivity benefits:
+
+| Approach | Setup | Per-Hook | Cleanup | Total (12 layers, 5 tokens) |
+|----------|-------|----------|---------|----------------------------|
+| **PyTorch hooks** | ~0.5ms | ~0.01ms | ~0.3ms | ~1.4ms |
+| **NNsight trace** | ~2.5ms | ~0.2ms | ~0ms | ~14.9ms |
+
+**NNsight is ~10x slower for raw hook operations**, but provides:
+
+| Feature | PyTorch Hooks | NNsight |
+|---------|---------------|---------|
+| Declarative syntax | ❌ Callbacks | ✅ Pythonic |
+| Automatic batching | ❌ Manual | ✅ Automatic |
+| Cross-layer sharing | ❌ Complex | ✅ Built-in |
+| Generation iteration | ❌ Manual | ✅ `tracer.iter[:]` |
+| Remote execution | ❌ Not possible | ✅ NDIF support |
+| Model editing | ❌ Permanent changes | ✅ Non-destructive |
+
+**For research and interpretability work, the productivity gains far outweigh the performance cost.**
+
+---
+
+### 10.7 Performance Best Practices
+
+#### 1. Batch Interventions
+
+Prefer many interventions in one trace over multiple small traces:
+
+```python
+# SLOW: Multiple traces (pays fixed cost multiple times)
+for layer_idx in range(12):
+    with model.trace(prompt):
+        hidden = model.transformer.h[layer_idx].output.save()
+
+# FAST: Single trace (pays fixed cost once)
+with model.trace(prompt):
+    hiddens = []
+    for layer_idx in range(12):
+        hiddens.append(model.transformer.h[layer_idx].output.save())
+```
+
+#### 2. Enable Trace Caching for Repeated Traces
+
+```python
+from nnsight import CONFIG
+CONFIG.APP.TRACE_CACHING = True
+
+# Now repeated traces with same structure are faster
+for prompt in dataset:
+    with model.trace(prompt):
+        hidden = model.transformer.h[5].output.save()
+```
+
+#### 3. Disable Unused Features
+
+```python
+from nnsight import CONFIG
+
+# If not sharing variables across invokes
+CONFIG.APP.CROSS_INVOCATION_CACHING = False
+
+# If only using nnsight.save() function
+CONFIG.APP.PYMOUNT = False
+```
+
+#### 4. Use Sessions for Related Traces
+
+Sessions amortize setup costs across multiple traces:
+
+```python
+with model.session() as session:
+    # All traces share setup costs
+    with model.trace("Hello"):
+        hs1 = model.transformer.h[0].output
+    
+    with model.trace("World"):
+        model.transformer.h[0].output = hs1
+        out = model.output.save()
+```
+
+---
+
+### 10.8 When NNsight Makes Sense
+
+NNsight's overhead is **negligible** when:
+
+1. **Model forward pass dominates** — Large models (7B+ parameters) spend most time in computation, not NNsight overhead
+2. **Multiple interventions per trace** — Fixed cost is amortized across many operations
+3. **Development speed matters** — Writing interventions takes minutes vs hours with raw hooks
+4. **You need advanced features** — Cross-invoke sharing, generation iteration, remote execution
+
+NNsight overhead **may matter** when:
+
+1. **Micro-benchmarking** — Timing individual operations at sub-millisecond precision
+2. **Real-time systems** — Strict latency requirements
+3. **Simple single-hook operations** — Raw hooks may be faster for trivial cases
+
+---
+
+### 10.9 Profiling Your Own Code
+
+To profile NNsight in your specific use case:
+
+```python
+import time
+import torch
+
+# Ensure GPU sync for accurate timing
+torch.cuda.synchronize()
+start = time.perf_counter()
+
+with model.trace(prompt):
+    hidden = model.transformer.h[5].output.save()
+
+torch.cuda.synchronize()
+end = time.perf_counter()
+
+print(f"Trace time: {(end - start) * 1000:.2f}ms")
+```
+
+For detailed profiling, use Python's `cProfile`:
+
+```python
+import cProfile
+import pstats
+
+with cProfile.Profile() as pr:
+    with model.trace(prompt):
+        hidden = model.transformer.h[5].output.save()
+
+stats = pstats.Stats(pr)
+stats.sort_stats('cumulative')
+stats.print_stats(20)
+```
+
+For comprehensive profiling data and benchmarks, see the [Performance Report](./tests/performance/profile/results/performance_report.md).

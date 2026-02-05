@@ -89,7 +89,7 @@ See the [Context7 README](https://github.com/upstash/context7/blob/master/README
 
 You can also add our documentation files directly to your agent's context:
 
-- **[llms.md](./llms.md)** — Comprehensive guide for AI agents working with nnsight
+- **[CLAUDE.md](./CLAUDE.md)** — Comprehensive guide for AI agents working with nnsight
 - **[NNsight.md](./NNsight.md)** — Deep technical documentation on nnsight's internals
 
 ---
@@ -499,8 +499,9 @@ For more debugging tips, see the [documentation](https://www.nnsight.net).
 ## More Resources
 
 - **[Documentation](https://www.nnsight.net)** — Tutorials, guides, and API reference
-- **[NNsight.md](./NNsight.md)** — Deep technical documentation on nnsight
-- **[llms.md](./llms.md)** — Comprehensive guide for AI agents working with nnsight
+- **[NNsight.md](./NNsight.md)** — Deep technical documentation on nnsight's internals
+- **[CLAUDE.md](./CLAUDE.md)** — Comprehensive guide for AI agents working with nnsight
+- **[Performance Report](./tests/performance/profile/results/performance_report.md)** — Detailed performance analysis and benchmarks
 
 ---
 
