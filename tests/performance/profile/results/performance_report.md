@@ -17,6 +17,8 @@ This report analyzes NNsight's performance characteristics to identify optimizat
 | **LanguageModel Generation** | 1.25x baseline | **Good** - acceptable overhead |
 | **CROSS_INVOKER** | +0.48ms | **Low priority** - feature cost |
 | **TRACE_CACHING** | 1.15x speedup | **Already implemented** |
+| **`.source` Injection** | ~2.8ms one-time | **Low priority** - one-time cost |
+| **`.source` Runtime** | 2.2% overhead | **Excellent** - minimal impact |
 
 ---
 
@@ -276,19 +278,118 @@ Based on benchmarking framework results:
 
 ---
 
-## 8. Conclusion
+## 8. `.source` Feature Profiling
+
+The `.source` feature allows access to intermediate operations within a module's forward pass, not just module boundaries. This section profiles its performance characteristics.
+
+### 8.1 How `.source` Works
+
+When you access `.source` on an Envoy:
+
+1. **Source Capture**: `inspect.getsource()` gets the forward method's source code
+2. **AST Parsing**: `ast.parse()` parses it into an Abstract Syntax Tree
+3. **AST Transformation**: `FunctionCallWrapper` wraps every function/method call
+4. **Compilation**: The transformed AST is compiled and exec'd
+5. **Method Replacement**: The module's `forward` is replaced with the wrapped version
+6. **EnvoySource Creation**: Returns an `EnvoySource` with `OperationEnvoy` objects
+
+### 8.2 Injection Cost (One-Time Per Module)
+
+```
+Component                Time (ms)    Percentage
+─────────────────────────────────────────────────────
+AST transformation       1.60         64%
+inspect.getsource()      0.51         20%
+ast.parse()              0.41         16%
+compile + exec           0.30         —
+─────────────────────────────────────────────────────
+Total (full inject)      2.82         100%
+```
+
+- **26 operations** were found and wrapped in GPT-2's attention module
+- **AST transformation dominates** - the `FunctionCallWrapper` visits every node and wraps every `Call` node
+- For complex forward methods with many operations, this scales linearly
+
+### 8.3 Runtime Overhead (Per Forward Pass)
+
+```
+Metric                   Time (ms)
+─────────────────────────────────────────────────────
+Baseline forward         4.53
+After .source injection  4.63
+─────────────────────────────────────────────────────
+Overhead                 0.10 (2.2%)
+```
+
+**Surprisingly low!** Even with 26 operations wrapped across 12 attention modules, the runtime overhead is minimal when you're not actually accessing the operations.
+
+This is because the `wrap()` function returns early when `not interleaving`:
+
+```python
+def wrap(fn: Callable, **kwargs):
+    if self.interleaving:
+        return self._interleaver.wrap_operation(fn, **kwargs)
+    else:
+        return fn  # Early return - minimal overhead
+```
+
+### 8.4 Operation Access (Per Trace)
+
+```
+Access Type              Time (ms)
+─────────────────────────────────────────────────────
+Module boundary only     8.82
+With .source operation   8.25
+6 .source operations     varies (within noise)
+─────────────────────────────────────────────────────
+Additional per .source   ~0ms (negligible)
+```
+
+The `.source` operation access has **negligible additional overhead** compared to module boundary access. Once injected, accessing `.input`/`.output` on operations is comparable to accessing them on modules.
+
+### 8.5 `.source` Optimization Opportunities
+
+| Priority | Optimization | Expected Impact | Complexity |
+|----------|--------------|-----------------|------------|
+| Low | AST transformation caching | Save ~1.6ms on repeated injection | Medium |
+| Low | Pre-computed injection for common models | Zero injection overhead | Low |
+| Not Recommended | Lazy operation wrapping | Only wrap accessed ops | High |
+
+**Recommendation:** Given the runtime overhead is only **2.2%**, and injection is a one-time cost, **performance optimization for `.source` is low priority**. The current implementation is efficient for its purpose.
+
+### 8.6 When to Use `.source`
+
+`.source` is valuable when you need to access intermediate operations that aren't exposed at module boundaries:
+
+```python
+with model.trace("Hello"):
+    # Access attention scores (not available at module boundary)
+    attn_out = model.transformer.h[0].attn.source.attention_interface_0.output.save()
+```
+
+**Performance guidance:**
+- **Injection cost**: ~2.8ms per module (one-time)
+- **Runtime overhead**: ~2.2% when not accessing operations
+- **Access overhead**: Negligible per operation
+
+---
+
+## 9. Conclusion
 
 NNsight's performance is **acceptable for its intended use case**. The overhead breakdown shows:
 
 1. **Fixed costs dominate** (~2.5ms per trace)
 2. **Per-intervention costs are minimal** (~0.2ms each)
 3. **LanguageModel overhead is only 25%** (excellent for an interpretability tool)
+4. **`.source` feature is efficient** (~2.8ms one-time injection, 2.2% runtime overhead)
 
 The main optimization opportunities are:
 - Enable TRACE_CACHING by default (easy win)
 - Document performance best practices
 
-**Key insight:** Source inspection and AST parsing (~0.35ms combined) are **required** for NNsight's core functionality - it must capture and parse the user's intervention code to understand and transform it. This is the fundamental cost of NNsight's declarative syntax, and cannot be optimized away without breaking the architecture.
+**Key insight:** Source inspection and AST parsing are **required** for NNsight's core functionality - it must capture and parse the user's intervention code to understand and transform it. This is the fundamental cost of NNsight's declarative syntax, and cannot be optimized away without breaking the architecture.
+
+**The `.source` feature** adds minimal overhead for its powerful capability to access intermediate forward method operations. The 2.2% runtime overhead when not accessing operations is excellent, and the one-time injection cost of ~2.8ms per module is acceptable.
 
 **No architectural changes are recommended.** The current design provides the flexibility and power that makes NNsight valuable, at an acceptable performance cost.
 
@@ -324,4 +425,25 @@ inspect.getsourcelines: 0.185ms
 Code compilation:       0.151ms
 Thread creation:        0.045ms
 Thread start:           0.274ms
+```
+
+### `.source` Feature Profile Output
+```
+Injection Components (GPT-2 attention module):
+  inspect.getsource:    0.509ms (20%)
+  ast.parse:            0.407ms (16%)
+  AST transformation:   1.603ms (64%)
+  compile + exec:       0.303ms
+  Full inject:          2.822ms
+  Operations wrapped:   26
+
+Runtime Overhead (12 attention modules injected):
+  Baseline forward:     4.53ms
+  After injection:      4.63ms
+  Overhead:             0.10ms (2.2%)
+
+Operation Access:
+  Module boundary:      8.82ms
+  .source operation:    8.25ms
+  Additional overhead:  ~0ms (negligible)
 ```
