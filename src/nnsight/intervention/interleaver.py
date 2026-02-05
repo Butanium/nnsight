@@ -101,6 +101,8 @@ class Interleaver:
         """
         self.initialize(mediators, tracer, batcher)
 
+        self.hook_handles = []
+
     def initialize(
         self,
         mediators: List[Mediator],
@@ -129,6 +131,12 @@ class Interleaver:
         self.default_all = None
 
         self.current = None
+
+    def __del__(self):
+        """Remove all hooks when the interleaver is garbage collected."""
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles = []
 
     def iterate_provider(self, provider: str):
         """
@@ -197,34 +205,31 @@ class Interleaver:
             None
         """
 
-        skip = None
-
         forward = module.forward
 
-        # If wrapping the same module more than once, we need to get the original forward function
+        # Check if already wrapped with skippable forward
         pre_wrapped = hasattr(forward, "__nnsight_original_forward__")
-        if pre_wrapped:
-            forward.__nnsight_input_handle__.remove()
-            forward.__nnsight_output_handle__.remove()
-            forward = forward.__nnsight_original_forward__
 
-        # Wrap the module's forward function first to enable skipping of the forward pass.
-        @wraps(forward)
-        def nnsight_forward(*args, **kwargs):
+        if not pre_wrapped:
+            # First time wrapping - create skippable forward wrapper
+            @wraps(forward)
+            def nnsight_forward(*args, **kwargs):
 
-            nonlocal skip
+                if skip_container[0] is not None:
+                    # Skip is set, return the skip value
+                    # (will be cleared by output hook)
+                    return skip_container[0]
 
-            if skip is None or not self.interleaving:
-                try:
-                    return forward(*args, **kwargs)
-                finally:
-                    skip = None
+                return forward(*args, **kwargs)
 
-            return skip
+            module.forward = nnsight_forward
+            nnsight_forward.__nnsight_original_forward__ = forward
+            module.__nnsight_skip__ = [None]
 
-        module.forward = nnsight_forward
+        skip_container = module.__nnsight_skip__
 
         # Hook the module's input to intercept and interleave the input values.
+        # Each interleaver adds its own hooks; they coexist and each checks its own interleaving state.
         @torch._dynamo.disable
         def input_hook(module: torch.nn.Module, args, kwargs):
 
@@ -232,19 +237,20 @@ class Interleaver:
             if not self.interleaving:
                 return args, kwargs
 
+            # Clear any stale skip for this module from previous failed traces
+            skip_container[0] = None
+
             # NNsight keeps the modules attribute path as the provider string on the module itself.
             provider = module.__path__
-
-            nonlocal skip
 
             # Provide the input values to the interleaver to be potentially consumed and/or modified by the mediators.
             # Iterate here means this provided can be provided more than once so the provider string will be updated to include the iteration.
             try:
                 inputs = self.handle(f"{provider}.input", (args, kwargs), iterate=True)
             # To skip a module, we raise a SkipException with the value we want to return instead.
-            # This is the same skip variable that the skippable forward method has refernce to, so we can set it here and it can be handled by the output hook later.
+            # The skip_container is shared so the skippable forward method can read it.
             except SkipException as e:
-                skip = e.value
+                skip_container[0] = e.value
             # If not skipping, just return the potentially modified input values.
             else:
                 args, kwargs = inputs
@@ -255,6 +261,7 @@ class Interleaver:
         input_handle = module.register_forward_pre_hook(
             input_hook, with_kwargs=True, prepend=True
         )
+        self.hook_handles.append(input_handle)
 
         @torch._dynamo.disable
         def output_hook(module: torch.nn.Module, _, output: Any):
@@ -266,14 +273,12 @@ class Interleaver:
             # NNsight keeps the modules attribute path as the provider string on the module itself.
             provider = module.__path__
 
-            nonlocal skip
-
             # If we are skipping, we set the output to the value we want to return and clear the skip variable.
-            if skip is not None:
+            if skip_container[0] is not None:
 
-                output = skip
+                output = skip_container[0]
 
-                skip = None
+                skip_container[0] = None
 
             # Provide the output values to the interleaver to be potentially consumed and/or modified by the mediators.
             # Iterate here means this provided can be provided more than once so the provider string will be updated to include the iteration.
@@ -283,12 +288,7 @@ class Interleaver:
 
         # Register the output hook to the module's forward post-hook.
         output_handle = module.register_forward_hook(output_hook, prepend=True)
-
-        # Store the original forward function, input handle, and output handle on the wrapped forward function.
-        # This is useful for unwrapping the module later in case of re-wrapping the module.
-        nnsight_forward.__nnsight_original_forward__ = forward
-        nnsight_forward.__nnsight_input_handle__ = input_handle
-        nnsight_forward.__nnsight_output_handle__ = output_handle
+        self.hook_handles.append(output_handle)
 
     def wrap_operation(self, fn: Callable, name: str, bound_obj: Optional[Any] = None):
         """
