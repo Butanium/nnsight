@@ -765,8 +765,10 @@ class RemoteBackend(Backend):
         """
         result_bytes = io.BytesIO()
 
+        timeout = httpx.Timeout(self.CONNECT_TIMEOUT, read=self.READ_TIMEOUT)
+
         # Stream download with progress bar
-        with httpx.Client() as client:
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("GET", url) as stream:
                 # Handle missing Content-Length header gracefully
                 total_size = content_length or float(
@@ -792,8 +794,10 @@ class RemoteBackend(Backend):
         """Async version of get_result(). See get_result() for full documentation."""
         result_bytes = io.BytesIO()
 
+        timeout = httpx.Timeout(self.CONNECT_TIMEOUT, read=self.READ_TIMEOUT)
+
         # Stream download with progress bar (async version)
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("GET", url) as stream:
                 # Handle missing Content-Length header gracefully
                 total_size = content_length or float(
