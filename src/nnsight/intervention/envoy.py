@@ -164,7 +164,9 @@ class Envoy(Batchable):
             return self._fake_output
         else:
             raise ValueError(
-                "Cannot return output of Envoy that is not interleaving nor has a fake output set."
+                f"The model did not execute — cannot access `{self.path}.output`. "
+                "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
+                "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
             )
 
     @output.setter
@@ -190,7 +192,11 @@ class Envoy(Batchable):
             )
 
         else:
-            raise ValueError("Cannot set output of Envoy that is not interleaving.")
+            raise ValueError(
+                f"The model did not execute — cannot set `{self.path}.output`. "
+                "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
+                "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
+            )
 
     @property
     def inputs(self) -> Tuple[Tuple[Object], Dict[str, Object]]:
@@ -219,7 +225,9 @@ class Envoy(Batchable):
             return self._fake_inputs
         else:
             raise ValueError(
-                "Cannot return inputs of Envoy that is not interleaving nor has a fake inputs set."
+                f"The model did not execute — cannot access `{self.path}.inputs`. "
+                "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
+                "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
             )
 
     @inputs.setter
@@ -244,7 +252,11 @@ class Envoy(Batchable):
                 self._interleaver.iterate_requester(f"{self.path}.input"), value
             )
         else:
-            raise ValueError("Cannot set inputs of Envoy that is not interleaving.")
+            raise ValueError(
+                f"The model did not execute — cannot set `{self.path}.inputs`. "
+                "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
+                "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
+            )
 
     @property
     def input(self) -> Object:

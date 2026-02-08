@@ -113,33 +113,37 @@ You MUST access modules (and their .output, .input, etc.) in the order they exec
 Accessing layer 5's output before layer 2 will result in a deadlock or error!
 */
 
-### Prompt-less Invokers
+### Empty Invokes (Prompt-less Invokers)
 
-Call `.invoke()` with **no arguments** to run intervention code on the **entire batch** from all previous invokes:
+Call `.invoke()` with **no arguments** to create an **empty invoke** that operates on the **entire batch** from all previous input invokes:
 
 ```python
 with model.trace() as tracer:
     with tracer.invoke("Hello"):
         out_1 = model.lm_head.output[:, -1].save()  # Shape: [1, vocab]
-    
+
     with tracer.invoke(["World", "Test"]):
         out_2 = model.lm_head.output[:, -1].save()  # Shape: [2, vocab]
-    
-    # No-arg invoke: operates on ALL 3 inputs batched together
+
+    # Empty invoke: operates on ALL 3 inputs batched together
     with tracer.invoke():
         out_all = model.lm_head.output[:, -1].save()  # Shape: [3, vocab]
-    
-    # Another no-arg invoke: same batch
+
+    # Another empty invoke: same full batch
     with tracer.invoke():
         out_all_2 = model.lm_head.output[:, -1].save()  # Shape: [3, vocab]
 
 # out_all contains the same data as concatenating out_1 and out_2
 ```
 
-This is useful for:
-- Running different intervention logic on the same batch
-- Accessing the combined batch after setting up individual invokes
-- Comparing interventions across the full batch
+Empty invokes are useful for:
+- **Batch-wide operations**: Access the combined batch from all input invokes
+- **Breaking up interventions**: Since modules must be accessed in forward-pass order within a single invoke, use multiple empty invokes to access the same module multiple times (each empty invoke is a separate thread)
+- **Comparing interventions**: Run different intervention logic on the same batch in separate invokes
+
+**Important**: Empty invokes don't trigger `_batch()`, so they work even on base `NNsight` models that don't implement batching. You can always use one input invoke + any number of empty invokes, even without implementing `_prepare_input()`/`_batch()`.
+
+**Note**: At least one input invoke must precede any empty invokes — without input data, the model has nothing to execute on.
 
 ### Key Properties
 
@@ -1628,12 +1632,12 @@ This shows internal NNsight frames, which can help:
 |-----------|-------|-----|
 | `OutOfOrderError: Value was missed for model.layer.output.i0` | Accessed modules in wrong order within an invoke | Access modules in forward-pass order |
 | `ValueError: Execution complete but ... was not provided` | Mediator still waiting - module never called or gradient order wrong | Check module path exists; access gradients in reverse order |
-| `ValueError: Cannot return output of Envoy that is not interleaving` | Trace has no input, model never ran | Provide input to `.trace(input)` or use `.invoke()` |
+| `ValueError: The model did not execute` | Trace has no input, model never ran | Provide input to `.trace(input)` or use `.invoke(input)` |
 | `ValueError: Cannot invoke during an active model execution` | Tried to create invoke inside another invoke | Use sequential, non-nested invokes |
 | `ValueError: Cannot request ... in a backwards tracer` | Accessed `.output`/`.input` inside `backward()` instead of `.grad` | Define tensors before backward, access `.grad` inside |
 | `AttributeError: ... has no attribute X` | Nonexistent module accessed | Use `print(model)` to see available modules |
 | `AttributeError: Tokenizer not found` | Wrapped pre-loaded model without providing tokenizer | Provide `tokenizer=` when wrapping pre-loaded models |
-| `NotImplementedError: Batching not implemented` | Multiple invokes on base `NNsight` | Use `LanguageModel` for multiple invokes, or single invoke |
+| `NotImplementedError: Batching is not implemented` | Multiple input invokes on base `NNsight` | Implement `_prepare_input()`/`_batch()` (see `LanguageModel`), or use one input invoke + empty invokes |
 
 **The `.i0` suffix** in error messages indicates iteration 0 (first call). In generation, you'd see `.i1`, `.i2`, etc.
 
@@ -1860,9 +1864,9 @@ Tips for working on nnsight internals or writing tests/benchmarks:
 
 ### Common Errors and What They Mean
 
-- **`ValueError: Cannot return output of Envoy that is not interleaving`** -- You're accessing `.output` outside a trace context, or the trace had no input so the model never ran. When writing benchmarks with closures (e.g., `lambda` or functions defined in a loop), check that the closure captures the correct wrapper variable.
+- **`ValueError: The model did not execute`** -- You're accessing `.output`/`.input` but the model never ran. Either the trace had no input, or you're outside a trace context. When writing benchmarks with closures (e.g., `lambda` or functions defined in a loop), check that the closure captures the correct wrapper variable. Fix: provide input to `.trace(input)` or `tracer.invoke(input)`.
 
-- **`NotImplementedError: Batching not implemented`** -- Multiple invokes (`tracer.invoke()`) require `LanguageModel`, not base `NNsight`. Base `NNsight` only supports a single implicit invoke. If you need multiple invokes for a plain PyTorch model, you'll need to implement a custom `Batcher`.
+- **`NotImplementedError: Batching is not implemented`** -- Multiple input invokes (invokes with arguments) require `_prepare_input()` and `_batch()` methods on the model class. Base `NNsight`/`Envoy` doesn't implement these. Options: (1) Use `LanguageModel` which implements batching, (2) implement a custom `_prepare_input()`/`_batch()` on your model class, or (3) use one input invoke + empty invokes (empty invokes operate on the full batch and don't trigger `_batch()`).
 
 - **`AttributeError: 'Info' object has no attribute 'pull'`** -- Can occur when `TRACE_CACHING = True` with certain source cache interactions. The source cache stores parsed AST nodes, and if the cache returns stale data for a different context, it can hit missing attributes. This is a known edge case.
 

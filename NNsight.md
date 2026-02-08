@@ -2142,6 +2142,41 @@ When you call `model.generate(...)` as a trace context, Envoy's `__getattr__` ch
 
 To support multiple invokes with different inputs in a single forward pass, model classes must implement batching.
 
+#### Input Invokes vs Empty Invokes
+
+There are two types of invokes, and the distinction is central to how batching works:
+
+- **Input invokes** — `tracer.invoke(input)` — provide input data that contributes to the batch. Each input invoke gets a `batch_group = [start, size]` specifying its slice of the batch dimension.
+
+- **Empty invokes** — `tracer.invoke()` (no arguments) — operate on the **entire** batch from all previous input invokes. They get `batch_group = None`, so `narrow()` returns the full batch and `swap()` replaces the full batch.
+
+```python
+with model.trace() as tracer:
+    # Input invoke: batch_group = [0, 1], sees only its own slice
+    with tracer.invoke("Hello"):
+        out1 = model.output.save()        # Shape: [1, ...]
+
+    # Input invoke: batch_group = [1, 1], sees only its own slice
+    with tracer.invoke("World"):
+        out2 = model.output.save()        # Shape: [1, ...]
+
+    # Empty invoke: batch_group = None, sees the FULL batch
+    with tracer.invoke():
+        out_all = model.output.save()     # Shape: [2, ...]
+
+    # Another empty invoke: also sees the full batch
+    with tracer.invoke():
+        out_all2 = model.output.save()    # Shape: [2, ...]
+```
+
+Empty invokes are useful for:
+
+1. **Batch-wide operations** — running intervention logic on the combined batch from all previous input invokes.
+2. **Breaking up interventions** — since modules must be accessed in forward-pass order within a single invoke, you can use multiple empty invokes to access the same module multiple times without order conflicts. Each empty invoke is a separate thread with its own execution sequence.
+3. **Comparing interventions** — defining different intervention logic in separate empty invokes that all operate on the same batch.
+
+**Important:** Empty invokes require at least one prior input invoke. Without any input invoke, the model has no data to execute on.
+
 #### Abstract Methods
 
 The `Batchable` base class (from `intervention/batching.py`) defines:
@@ -2149,17 +2184,18 @@ The `Batchable` base class (from `intervention/batching.py`) defines:
 ```python
 class Batchable:
     def _prepare_input(self, *inputs, **kwargs):
-        """Normalize user input to a consistent format."""
-        return inputs, kwargs
-    
+        """Normalize user input. Returns (args, kwargs, batch_size).
+        batch_size=0 for empty invokes."""
+        if inputs or kwargs:
+            return inputs, kwargs, 1
+        return inputs, kwargs, 0
+
     def _batch(self, batched_input, *args, **kwargs):
         """Combine multiple invokes' inputs into one batch."""
-        raise NotImplementedError(
-            "Batching not implemented for this model"
-        )
+        raise NotImplementedError(...)
 ```
 
-**Without `_batch()` implemented, your model cannot use multiple invokes with inputs.**
+**Without `_batch()` implemented, your model cannot use multiple input invokes.** You can still use one input invoke plus any number of empty invokes, since empty invokes don't trigger `_batch()`.
 
 #### How Batching Works
 
@@ -2167,42 +2203,44 @@ When you define multiple invokes:
 
 ```python
 with model.trace() as tracer:
-    with tracer.invoke("Hello"):
+    with tracer.invoke("Hello"):    # Input invoke
         ...
-    with tracer.invoke("World"):
+    with tracer.invoke("World"):    # Input invoke (triggers _batch)
+        ...
+    with tracer.invoke():           # Empty invoke (no _batch needed)
         ...
 ```
 
 The `Batcher`:
 
 1. Calls `_prepare_input()` for each invoke's input
-2. Calls `_batch()` to combine them
-3. Tracks `batch_group` for each invoke: `[start_idx, batch_size]`
-4. During interleaving, `narrow()` extracts each invoke's slice
+2. For the first input invoke, stores the prepared input directly
+3. For subsequent input invokes, calls `_batch()` to combine them
+4. Tracks `batch_group` for each invoke: `[start_idx, batch_size]` for input invokes, `None` for empty invokes
+5. During interleaving, `narrow()` extracts each invoke's slice (or returns the full batch for empty invokes)
 
 #### LanguageModel Batching Example
+
+`LanguageModel` is the reference implementation for batching. It handles tokenization, padding, and attention mask construction:
 
 ```python
 class LanguageModel:
     def _prepare_input(self, *inputs, input_ids=None, **kwargs):
-        # Normalize to BatchEncoding
+        # Normalize to BatchEncoding (tokenize strings, handle tensors, etc.)
         if isinstance(inputs[0], str):
             inputs = self._tokenize(inputs[0])
-        return tuple(), {**inputs}
-    
+        return tuple(), {**inputs}, len(inputs["input_ids"])
+
     def _batch(self, batched_inputs, **prepared_kwargs):
-        if batched_inputs is None:
-            # First invoke
-            return (tuple(), prepared_kwargs), len(prepared_kwargs["input_ids"])
-        
-        # Combine with padding
+        # Combine with padding via tokenizer.pad()
         combined = self.tokenizer.pad([
-            *batched_inputs["input_ids"],
-            *prepared_kwargs["input_ids"],
+            *batched_inputs[1]["input_ids"].tolist(),
+            *prepared_kwargs["input_ids"].tolist(),
         ])
-        
-        return (tuple(), combined), len(prepared_kwargs["input_ids"])
+        return tuple(), {**combined, **batched_inputs[1]}
 ```
+
+To implement batching for a custom model, override both `_prepare_input()` and `_batch()` on your model class (which inherits from `Envoy`, which inherits from `Batchable`).
 
 ---
 
