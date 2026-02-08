@@ -241,7 +241,7 @@ class Tracer:
 
         cached = Globals.cache.get(cache_key)
 
-        if CONFIG.APP.TRACE_CACHING and cached is not None:
+        if cached is not None:
 
             source_lines, start_line, node, filename = cached
 
@@ -349,11 +349,10 @@ class Tracer:
             source_lines, frame, start_line, node, cache_key=cache_key
         )
 
-        if CONFIG.APP.TRACE_CACHING:
-            Globals.cache.add(
-                cache_key,
-                (source_lines, start_line, node, self.info.filename),
-            )
+        Globals.cache.add(
+            cache_key,
+            (source_lines, start_line, node, self.info.filename),
+        )
 
     def parse(self, source_lines: List[str], start_line: int):
         """

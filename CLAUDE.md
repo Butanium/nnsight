@@ -53,6 +53,8 @@ with model.trace("input text"):
 19. [Critical Gotchas](#critical-gotchas)
 20. [Debugging Tips](#debugging-tips)
 21. [Configuration](#configuration)
+22. [Performance Tips](#performance-tips)
+23. [Development & Testing Notes](#development--testing-notes)
 
 ---
 
@@ -1812,6 +1814,86 @@ model2 = NNsight(my_pytorch_model)  # Safe - hooks replaced, not duplicated
 
 
 **Note on `.grad`:** Access gradients on **tensors** only inside a `with tensor.backward():` context. See [Gradients and Backpropagation](#gradients-and-backpropagation).
+
+---
+
+## Performance Tips
+
+### Where NNsight Overhead Lives
+
+Each `with model.trace(...)` has a fixed ~0.6ms setup cost (source extraction, AST parsing, compilation, thread creation). Per-intervention cost is much smaller (~0.04-0.2ms per `.output`/`.input` access). The fixed cost is constant regardless of model size, so it becomes negligible for real models.
+
+### Key Optimization: Consolidate Traces
+
+The single biggest performance win is putting multiple interventions in one trace instead of using separate traces:
+
+```python
+# BAD (~12ms): 12 separate traces, each pays ~0.6ms setup
+for layer in model.transformer.h:
+    with model.trace(prompt):
+        hidden = layer.output.save()
+
+# GOOD (~1.3ms): 1 trace, 12 saves amortize setup to ~0.04ms each
+with model.trace(prompt):
+    hiddens = []
+    for layer in model.transformer.h:
+        hiddens.append(layer.output.save())
+```
+
+### Code Object Caching
+
+Compiled code objects are automatically cached per trace site. Running the same `with model.trace(...)` in a loop only compiles on the first iteration. The cache key is `(filename, line_number, function_name, tracer_type)`, so different tracer types (InterleavingTracer vs Invoker) are cached independently.
+
+### Configuration for Performance
+
+- `CONFIG.APP.TRACE_CACHING = True` -- Also caches source lines and AST, saving ~0.15ms/trace on repeated calls. Off by default.
+- `CONFIG.APP.PYMOUNT = False` -- Disables the C extension that mounts `.save()` on all objects. Use `nnsight.save()` instead. Negligible performance difference since pymount is now mounted once and never unmounted.
+- `CONFIG.APP.CROSS_INVOKER = False` -- Disables cross-invoke variable sharing. Small savings from skipping variable injection.
+
+For detailed performance analysis, see [NNsight.md Section 10](./NNsight.md).
+
+---
+
+## Development & Testing Notes
+
+Tips for working on nnsight internals or writing tests/benchmarks:
+
+### Common Errors and What They Mean
+
+- **`ValueError: Cannot return output of Envoy that is not interleaving`** -- You're accessing `.output` outside a trace context, or the trace had no input so the model never ran. When writing benchmarks with closures (e.g., `lambda` or functions defined in a loop), check that the closure captures the correct wrapper variable.
+
+- **`NotImplementedError: Batching not implemented`** -- Multiple invokes (`tracer.invoke()`) require `LanguageModel`, not base `NNsight`. Base `NNsight` only supports a single implicit invoke. If you need multiple invokes for a plain PyTorch model, you'll need to implement a custom `Batcher`.
+
+- **`AttributeError: 'Info' object has no attribute 'pull'`** -- Can occur when `TRACE_CACHING = True` with certain source cache interactions. The source cache stores parsed AST nodes, and if the cache returns stale data for a different context, it can hit missing attributes. This is a known edge case.
+
+### Writing Benchmarks
+
+- **Define trace functions at module level**, not inside loops. nnsight extracts source via `inspect.getsourcelines()`, which needs the function's source to be readable from a file. Functions defined inside `-c` strings or dynamically can cause issues.
+- **Closure scoping matters.** When defining benchmark functions in a loop, Python closures capture variables by reference. A function defined inside `for wrapper in [w1, w2]:` will use the *last* value of `wrapper` unless you bind it explicitly (e.g., `def fn(w=wrapper): ...`).
+- **Warmup before timing.** The first trace at a given call site compiles code objects; subsequent calls hit the cache. Always run 2-3 warmup iterations before measuring.
+- **Use `time.perf_counter()` for wall-clock timing** and `cProfile` for function-level breakdown. For GPU, call `torch.cuda.synchronize()` before start/stop.
+
+### Key Source Files for Performance Work
+
+| File | Role |
+|------|------|
+| `intervention/tracing/base.py` | `Tracer.capture()` -- source extraction, AST parsing, `Info` creation |
+| `intervention/backends/base.py` | `Backend.__call__()` -- code compilation, code object caching, exec |
+| `intervention/tracing/globals.py` | `Globals.enter()/exit()` -- pymount lifecycle, `TracingCache` |
+| `intervention/interleaver.py` | Hook dispatch, thread management, mediator event loop |
+| `intervention/tracing/tracer.py` | `InterleavingTracer.compile()` -- function wrapping |
+| `intervention/tracing/invoker.py` | `Invoker.compile()` -- function wrapping with try/catch |
+
+### Running Tests
+
+```bash
+# Full validation suite
+pytest tests/test_lm.py tests/test_tiny.py tests/test_0516_features.py \
+  tests/test_debug.py tests/test_memory_cleanup.py tests/test_multiple_wrappers.py --device cpu
+
+# Quick smoke test
+pytest tests/test_tiny.py --device cpu -x
+```
 
 ---
 

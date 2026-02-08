@@ -103,6 +103,7 @@ class Interleaver:
         """
         self.initialize(mediators, tracer, batcher)
 
+        self._interleaving = False
         self.hook_handles = []
 
     def initialize(
@@ -345,7 +346,7 @@ class Interleaver:
         Returns:
             bool: True if the interleaver is interleaving, False otherwise
         """
-        return getattr(self, "_interleaving", False)
+        return self._interleaving
 
     def __enter__(self):
 

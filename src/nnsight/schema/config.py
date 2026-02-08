@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Optional
 import sys
 import yaml
@@ -28,6 +29,17 @@ class AppConfigModel(BaseModel):
     CACHE_DIR: str = "~/.cache/nnsight/"
     CROSS_INVOKER: bool = True
     TRACE_CACHING: bool = False
+
+    def __setattr__(self, name, value):
+        if name == "TRACE_CACHING" and value is True:
+            warnings.warn(
+                "TRACE_CACHING is deprecated. Trace caching (source, AST, and code object caching) "
+                "is now always enabled. Setting TRACE_CACHING has no effect and will be "
+                "removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        super().__setattr__(name, value)
 
 
 class ConfigModel(BaseModel):

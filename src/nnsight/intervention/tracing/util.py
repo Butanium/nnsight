@@ -58,18 +58,20 @@ def try_catch(
     return indent(source)
 
 
+_devnull = open(os.devnull, "w")
+
+
 @contextlib.contextmanager
 def suppress_all_output():
-    with open(os.devnull, "w") as devnull:
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        try:
-            sys.stdout = devnull
-            sys.stderr = devnull
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    try:
+        sys.stdout = _devnull
+        sys.stderr = _devnull
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
 
 
 def get_dependencies(fn: Callable):

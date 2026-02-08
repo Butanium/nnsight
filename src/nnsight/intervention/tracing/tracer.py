@@ -2,6 +2,8 @@ import copy
 import inspect
 import re
 from dataclasses import dataclass
+
+
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -31,6 +33,8 @@ class Cache:
     transformations such as detaching from computation graph, moving to a
     specific device, or converting to a specific dtype.
     """
+
+    CACHE_PROVIDER_RE = re.compile(r"^(.+)\.([^.]+)\.i(\d+)$")
 
     @dataclass
     class Entry:
@@ -218,7 +222,7 @@ class Cache:
         """
 
         # Match pattern like "x.y.z.key.i1" into groups
-        match = re.match(r"^(.+)\.([^.]+)\.i(\d+)$", provider)
+        match = Cache.CACHE_PROVIDER_RE.match(provider)
 
         if match is None:
             return
