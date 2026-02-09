@@ -193,7 +193,7 @@ class Envoy(Batchable):
 
         else:
             raise ValueError(
-                f"The model did not execute — cannot set `{self.path}.output`. "
+                f"Cannot set `{self.path}.output`. The model is not executing during interleaving."
                 "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
                 "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
             )
@@ -225,7 +225,7 @@ class Envoy(Batchable):
             return self._fake_inputs
         else:
             raise ValueError(
-                f"The model did not execute — cannot access `{self.path}.inputs`. "
+                f"Cannot access `{self.path}.inputs`. The model is not executing during interleaving."
                 "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
                 "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
             )
@@ -253,7 +253,7 @@ class Envoy(Batchable):
             )
         else:
             raise ValueError(
-                f"The model did not execute — cannot set `{self.path}.inputs`. "
+                f"Cannot set `{self.path}.inputs`. The model is not executing during interleaving."
                 "Did you forget to pass a valid input to `.trace()` or `.invoke()`? "
                 "Use `model.trace(input)` or `tracer.invoke(input)` to provide input."
             )

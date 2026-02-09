@@ -238,7 +238,6 @@ class Interleaver:
 
         # Hook the module's input to intercept and interleave the input values.
         # Each interleaver adds its own hooks; they coexist and each checks its own interleaving state.
-        @torch._dynamo.disable
         def input_hook(module: torch.nn.Module, args, kwargs):
 
             # If not interleaving, just return the original input values.
@@ -271,7 +270,6 @@ class Interleaver:
         )
         self.hook_handles.append(input_handle)
 
-        @torch._dynamo.disable
         def output_hook(module: torch.nn.Module, _, output: Any):
 
             # If not interleaving, just return the original output values.
@@ -650,7 +648,10 @@ class Mediator:
         """
         self.interleaver = interleaver
 
-        self.original_globals = self.intervention.__globals__.copy()
+        # Only copy globals that the intervention code actually references.
+        all_globals = self.intervention.__globals__
+        co_names = self.intervention.__code__.co_names
+        self.original_globals = {k: all_globals[k] for k in co_names if k in all_globals}
 
         self.cross_invoker = (
             len(self.interleaver.mediators) > 1 and CONFIG.APP.CROSS_INVOKER

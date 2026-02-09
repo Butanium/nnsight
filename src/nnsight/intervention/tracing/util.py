@@ -340,6 +340,11 @@ def get_non_nnsight_frame() -> FrameType:
     return frame
 
 
+_py_object = ctypes.py_object
+_c_int_0 = ctypes.c_int(0)
+_locals_to_fast = ctypes.pythonapi.PyFrame_LocalsToFast
+
+
 def push_variables(frame: FrameType, variables: Dict):
 
     is_generated_frame = frame.f_code.co_filename.startswith("<nnsight")
@@ -353,11 +358,10 @@ def push_variables(frame: FrameType, variables: Dict):
         for key, value in global_variables.items():
             frame.f_globals[key] = value
 
-            ctypes.pythonapi.PyFrame_LocalsToFast(
-                ctypes.py_object(frame), ctypes.c_int(0)
-            )
-
+    # Get the f_locals dict once to avoid re-sync on each property access,
+    # then batch all assignments and sync back in a single call.
+    locals_dict = frame.f_locals
     for key, value in variables.items():
-        frame.f_locals[key] = value
+        locals_dict[key] = value
 
-        ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frame), ctypes.c_int(0))
+    _locals_to_fast(_py_object(frame), _c_int_0)

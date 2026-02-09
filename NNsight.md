@@ -3905,19 +3905,19 @@ NNsight overhead has two components:
 
 | Component | Cost | Scaling |
 |-----------|------|---------|
-| **Trace setup** (fixed) | ~0.6ms | Once per `with model.trace(...)` |
-| **Per-intervention** | ~0.04-0.2ms | Per `.output`/`.input` access |
+| **Trace setup** (fixed) | ~0.3ms | Once per `with model.trace(...)` |
+| **Per-intervention** | ~0.03-0.2ms | Per `.output`/`.input` access |
 
 The trace setup cost is constant regardless of model size, so it becomes a smaller fraction of total time as models get larger:
 
 ```
 Model hidden dim     Bare forward    With nnsight    Overhead ratio
 ────────────────────────────────────────────────────────────────────
-64                   0.25ms          1.02ms          4.0x
-256                  0.33ms          1.08ms          3.3x
-512                  0.47ms          1.31ms          2.8x
-1024                 0.63ms          1.64ms          2.6x
-2048                 1.06ms          2.21ms          2.1x
+64                   0.10ms          0.54ms          5.4x
+256                  0.17ms          0.61ms          3.6x
+512                  0.30ms          0.77ms          2.6x
+1024                 0.34ms          0.79ms          2.3x
+2048                 0.92ms          1.40ms          1.5x
 ```
 
 *12-layer MLP, CPU, batch size 1, single `.output.save()`*
@@ -3927,43 +3927,40 @@ The same pattern holds for larger batch sizes:
 ```
 Batch size           Bare forward    With nnsight    Overhead ratio
 ────────────────────────────────────────────────────────────────────
-1                    0.51ms          1.56ms          3.0x
-8                    0.68ms          1.60ms          2.4x
-32                   1.21ms          2.18ms          1.8x
-128                  2.18ms          3.27ms          1.5x
+1                    0.36ms          0.81ms          2.3x
+8                    0.51ms          0.90ms          1.8x
+32                   0.84ms          1.35ms          1.6x
+128                  1.31ms          1.92ms          1.5x
 ```
 
 *12-layer MLP, hidden=512, CPU, single `.output.save()`*
 
-**Key takeaway:** For real-world models (billions of parameters, GPU compute, generation loops), the ~0.6ms fixed cost is noise. NNsight overhead only matters for micro-benchmarks with tiny models.
+**Key takeaway:** For real-world models (billions of parameters, GPU compute, generation loops), the ~0.3ms fixed cost is noise. NNsight overhead only matters for micro-benchmarks with tiny models.
 
 ---
 
 ### 10.2 Where the Overhead Comes From
 
-Each `with model.trace(...)` block triggers a pipeline of operations before and during model execution. Here is what that pipeline costs, measured via `cProfile` over 200 traced iterations of a 12-layer MLP:
+Each `with model.trace(...)` block triggers a pipeline of operations before and during model execution. Here is what that pipeline costs, measured via `cProfile` over 500 traced iterations of a 12-layer MLP:
 
-#### Trace setup phase (~0.35ms)
+#### Trace setup phase (~0.15ms, cached)
 
 | Operation | Cost/trace | What it does |
 |-----------|-----------|--------------|
-| `inspect.getsourcelines()` | ~0.07ms | Reads source code of the calling function |
-| AST parsing (`ast.generic_visit`) | ~0.13ms | Walks AST to find `with` block boundaries |
+| `inspect.getsourcelines()` | ~0.07ms | Reads source code of the calling function (cached after first call) |
+| AST parsing (`ast.generic_visit`) | ~0.13ms | Walks AST to find `with` block boundaries (cached after first call) |
 | `builtins.compile()` | ~0.05ms | Compiles extracted source into Python code object (cached after first call) |
-| `get_non_nnsight_frame()` | ~0.03ms | Walks call stack to find user frame |
-| `push_variables()` | ~0.04ms | Injects variables into generated code frame via `ctypes` |
+| `get_non_nnsight_frame()` | ~0.02ms | Walks call stack to find user frame |
+| `push_variables()` | ~0.02ms | Injects variables into generated code frame via `ctypes` |
 
-**Source extraction and AST parsing** are the largest costs. NNsight captures your intervention code as text, parses it to find the `with` block boundaries, wraps it in a function definition, and compiles it. This is fundamental to how the deferred execution model works -- it is what allows you to write natural Python inside a `with` block that actually executes in a synchronized worker thread.
+**Source extraction, AST parsing, and code compilation** are all cached after the first call for a given trace site. Subsequent calls to the same `with model.trace(...)` at the same source location skip these entirely. The cache key is `(filename, line_number, function_name, tracer_type)`, so traces in a loop are compiled once. This means the trace setup phase drops from ~0.35ms (first call) to ~0.15ms (subsequent calls).
 
-**Code compilation** (`builtins.compile()`) is cached after the first call for a given trace site. Subsequent calls to the same `with model.trace(...)` at the same source location skip compilation entirely. The cache key is `(filename, line_number, function_name, tracer_type)`, so traces in a loop are compiled once.
-
-#### Execution phase (~0.25ms)
+#### Execution phase (~0.15ms)
 
 | Operation | Cost/trace | What it does |
 |-----------|-----------|--------------|
 | Thread creation | ~0.06ms | Spawns worker thread for intervention code |
-| Hook dispatch (`handle`, `handle_value_event`) | ~0.08ms | PyTorch hook → mediator event queue → worker thread |
-| `torch._dynamo.eval_frame` | ~0.07ms | TorchDynamo frame evaluation (per-module) |
+| Hook dispatch (`handle`, `handle_value_event`) | ~0.05ms | PyTorch hook → mediator event queue → worker thread |
 | Lock synchronization | ~0.04ms | Thread coordination between model and intervention code |
 
 **Threading** is required for the interleaving model: your intervention code runs in a worker thread that blocks on `.output` until the model's forward pass reaches that module. The main thread and worker thread coordinate via event queues and locks.
@@ -3974,30 +3971,22 @@ Each `with model.trace(...)` block triggers a pipeline of operations before and 
 
 ### 10.3 Caching Behavior
 
-NNsight has two levels of caching:
-
-#### Code object caching (always active)
-
-When the same trace site is executed repeatedly (e.g., in a loop), the compiled Python code object is cached and reused. This avoids the ~0.05ms `builtins.compile()` cost on subsequent iterations.
+NNsight automatically caches all stages of trace compilation. When the same trace site is executed repeatedly (e.g., in a loop), the extracted source, parsed AST, and compiled code object are all cached and reused. Only the first call pays the full compilation cost; subsequent calls skip source extraction, AST parsing, and compilation entirely.
 
 ```python
 for prompt in dataset:
-    with model.trace(prompt):  # compile() called once, cached for all iterations
+    with model.trace(prompt):  # Full compile on first iteration, cached for all subsequent
         hidden = model.transformer.h[5].output.save()
 ```
 
-The cache key includes the tracer type, so `InterleavingTracer` and `Invoker` code objects are cached independently even when they originate from the same source location.
+The cache key is `(filename, line_number, function_name, tracer_type)`, so `InterleavingTracer` and `Invoker` code objects are cached independently even when they originate from the same source location. The `TRACE_CACHING` config option is deprecated — caching is now always enabled.
 
-#### Source caching (`TRACE_CACHING`, off by default)
-
-When enabled, also caches the extracted source lines and parsed AST nodes. This avoids `inspect.getsourcelines()` and AST parsing on repeated calls.
+To clear the cache (e.g., after modifying source code at runtime):
 
 ```python
-from nnsight import CONFIG
-CONFIG.APP.TRACE_CACHING = True
+from nnsight.intervention.tracing.globals import Globals
+Globals.cache.clear()
 ```
-
-This provides an additional ~0.15ms savings per trace for repeated calls.
 
 ---
 
@@ -4005,15 +3994,15 @@ This provides an additional ~0.15ms savings per trace for repeated calls.
 
 #### 1. Consolidate interventions into a single trace
 
-The fixed per-trace cost (~0.6ms) means that 12 separate traces cost ~10x more than 1 trace with 12 interventions:
+The fixed per-trace cost (~0.3ms) means that 12 separate traces cost ~10x more than 1 trace with 12 interventions:
 
 ```python
-# SLOW (~12ms): 12 traces, each pays full setup cost
+# SLOW (~6ms): 12 traces, each pays full setup cost
 for layer in model.transformer.h:
     with model.trace(prompt):
         hidden = layer.output.save()
 
-# FAST (~1.3ms): 1 trace, 12 saves amortize setup cost
+# FAST (~0.7ms): 1 trace, 12 saves amortize setup cost
 with model.trace(prompt):
     hiddens = []
     for layer in model.transformer.h:
@@ -4022,20 +4011,7 @@ with model.trace(prompt):
 
 This is the single most impactful optimization. Consolidating from N traces to 1 trace gives roughly an Nx speedup.
 
-#### 2. Enable `TRACE_CACHING` for repeated traces
-
-If running the same trace structure in a loop (common in experiments iterating over a dataset), enable source caching to skip source extraction and AST parsing after the first call:
-
-```python
-from nnsight import CONFIG
-CONFIG.APP.TRACE_CACHING = True
-
-for prompt in dataset:
-    with model.trace(prompt):
-        hidden = model.transformer.h[5].output.save()
-```
-
-#### 3. Use `nnsight.save()` over `.save()` when `PYMOUNT` is not needed
+#### 2. Use `nnsight.save()` over `.save()` when `PYMOUNT` is not needed
 
 The `.save()` method form relies on pymount, a C extension that injects `.save()` onto every Python object by modifying `PyBaseObject_Type`. This is convenient but has a one-time cost on first trace entry. If you exclusively use the function form, you can disable it:
 
@@ -4138,12 +4114,10 @@ The key functions to look for in profiles:
 
 These are the current bottleneck areas, listed in order of impact:
 
-1. **Source extraction + AST parsing** (~0.20ms/trace) -- `inspect.getsourcelines()` reads the source file and `ast.generic_visit` walks the full AST. Enabling `TRACE_CACHING` eliminates this cost after the first call.
+1. **Thread creation** (~0.06ms/trace) -- Each invoke spawns a new OS thread. A thread pool could amortize this, but would be a larger architectural change.
 
-2. **Thread creation** (~0.06ms/trace) -- Each invoke spawns a new OS thread. A thread pool could amortize this, but would be a larger architectural change.
+2. **Hook dispatch overhead** (~0.05ms/trace) -- Every module in the model gets input/output hooks checked, even modules that have no interventions. The cost scales with the number of modules in the model.
 
-3. **Hook dispatch overhead** (~0.08ms/trace) -- Every module in the model gets input/output hooks checked, even modules that have no interventions. The cost scales with the number of modules in the model.
+3. **Lock synchronization** (~0.04ms/trace) -- Thread coordination between the main thread (model forward pass) and worker threads (intervention code). This is the fundamental floor for the interleaving model.
 
-4. **TorchDynamo frame evaluation** (~0.07ms/trace) -- `torch._dynamo.eval_frame` is called per-module during the forward pass. This is PyTorch overhead, not nnsight-specific, but it compounds with hook dispatch.
-
-5. **`push_variables` / `ctypes.PyFrame_LocalsToFast`** (~0.04ms/trace) -- Variable injection into generated frames via ctypes. Required for cross-invoke variable sharing (`CROSS_INVOKER`).
+4. **`push_variables` / `ctypes.PyFrame_LocalsToFast`** (~0.02ms/trace) -- Variable injection into generated frames via ctypes. Required for cross-invoke variable sharing (`CROSS_INVOKER`). Now batched to a single `PyFrame_LocalsToFast` call per frame update.

@@ -1825,32 +1825,31 @@ model2 = NNsight(my_pytorch_model)  # Safe - hooks replaced, not duplicated
 
 ### Where NNsight Overhead Lives
 
-Each `with model.trace(...)` has a fixed ~0.6ms setup cost (source extraction, AST parsing, compilation, thread creation). Per-intervention cost is much smaller (~0.04-0.2ms per `.output`/`.input` access). The fixed cost is constant regardless of model size, so it becomes negligible for real models.
+Each `with model.trace(...)` has a fixed ~0.3ms setup cost (source extraction, AST parsing, compilation, thread creation). Per-intervention cost is much smaller (~0.03-0.2ms per `.output`/`.input` access). The fixed cost is constant regardless of model size, so it becomes negligible for real models.
 
 ### Key Optimization: Consolidate Traces
 
 The single biggest performance win is putting multiple interventions in one trace instead of using separate traces:
 
 ```python
-# BAD (~12ms): 12 separate traces, each pays ~0.6ms setup
+# BAD (~6ms): 12 separate traces, each pays ~0.3ms setup
 for layer in model.transformer.h:
     with model.trace(prompt):
         hidden = layer.output.save()
 
-# GOOD (~1.3ms): 1 trace, 12 saves amortize setup to ~0.04ms each
+# GOOD (~0.7ms): 1 trace, 12 saves amortize setup to ~0.03ms each
 with model.trace(prompt):
     hiddens = []
     for layer in model.transformer.h:
         hiddens.append(layer.output.save())
 ```
 
-### Code Object Caching
+### Automatic Caching
 
-Compiled code objects are automatically cached per trace site. Running the same `with model.trace(...)` in a loop only compiles on the first iteration. The cache key is `(filename, line_number, function_name, tracer_type)`, so different tracer types (InterleavingTracer vs Invoker) are cached independently.
+Source lines, AST nodes, and compiled code objects are all automatically cached per trace site. Running the same `with model.trace(...)` in a loop only compiles on the first iteration. The cache key is `(filename, line_number, function_name, tracer_type)`, so different tracer types (InterleavingTracer vs Invoker) are cached independently. The `TRACE_CACHING` config is deprecated (caching is now always enabled).
 
 ### Configuration for Performance
 
-- `CONFIG.APP.TRACE_CACHING = True` -- Also caches source lines and AST, saving ~0.15ms/trace on repeated calls. Off by default.
 - `CONFIG.APP.PYMOUNT = False` -- Disables the C extension that mounts `.save()` on all objects. Use `nnsight.save()` instead. Negligible performance difference since pymount is now mounted once and never unmounted.
 - `CONFIG.APP.CROSS_INVOKER = False` -- Disables cross-invoke variable sharing. Small savings from skipping variable injection.
 
@@ -1868,7 +1867,7 @@ Tips for working on nnsight internals or writing tests/benchmarks:
 
 - **`NotImplementedError: Batching is not implemented`** -- Multiple input invokes (invokes with arguments) require `_prepare_input()` and `_batch()` methods on the model class. Base `NNsight`/`Envoy` doesn't implement these. Options: (1) Use `LanguageModel` which implements batching, (2) implement a custom `_prepare_input()`/`_batch()` on your model class, or (3) use one input invoke + empty invokes (empty invokes operate on the full batch and don't trigger `_batch()`).
 
-- **`AttributeError: 'Info' object has no attribute 'pull'`** -- Can occur when `TRACE_CACHING = True` with certain source cache interactions. The source cache stores parsed AST nodes, and if the cache returns stale data for a different context, it can hit missing attributes. This is a known edge case.
+- **`AttributeError: 'Info' object has no attribute 'pull'`** -- Can occur with certain source cache interactions. The source cache stores parsed AST nodes, and if the cache returns stale data for a different context, it can hit missing attributes. This is a known edge case. Try `Globals.cache.clear()` from `nnsight.intervention.tracing.globals` to reset the cache.
 
 ### Writing Benchmarks
 
