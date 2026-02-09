@@ -542,28 +542,28 @@ Each `iter` moves a cursor that tracks which generation step the mediator (worke
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
     logits = list().save()
-    
+
     # All steps (slice)
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.lm_head.output[0][-1].argmax(dim=-1))
-    
+
 # Or specific steps
 with model.generate("Hello", max_new_tokens=5) as tracer:
     logits = list().save()
-    
+
     # Steps 1-3 only (slice)
-    with tracer.iter[1:3]:
+    for step in tracer.iter[1:3]:
         logits.append(model.lm_head.output)
 
 # Single step (int)
 with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[0]:
+    for step in tracer.iter[0]:
         first_logits = model.lm_head.output.save()
 
 # Specific steps (list)
 with model.generate("Hello", max_new_tokens=5) as tracer:
     logits = list().save()
-    with tracer.iter[[0, 2, 4]]:
+    for step in tracer.iter[[0, 2, 4]]:
         logits.append(model.lm_head.output)
 ```
 
@@ -572,12 +572,12 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
     outputs = list().save()
-    
-    with tracer.iter[:] as step_idx:
+
+    for step_idx in tracer.iter[:]:
         if step_idx == 2:
             # Only intervene on step 2
             model.transformer.h[0].output[0][:] = 0
-        
+
         outputs.append(model.transformer.h[-1].output[0])
 ```
 
@@ -586,9 +586,9 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
 ```python
 with model.generate("Hello", max_new_tokens=3) as tracer:
     hidden_states = list().save()
-    
+
     # Apply to all generation steps for all descendants
-    with tracer.all():
+    for step in tracer.all():
         model.transformer.h[0].output[0][:] = 0
         hidden_states.append(model.transformer.h[-1].output)
 ```
@@ -609,20 +609,20 @@ with model.generate("Hello", max_new_tokens=3) as tracer:
 
 ### ⚠️ Critical Footgun: Unbounded Iteration
 
-**When using `tracer.iter[:]` or `tracer.all()`, code AFTER the iter block never executes.**
+**When using `tracer.iter[:]` or `tracer.all()`, code AFTER the iter loop never executes.**
 
 These unbounded iterators don't know when to stop — they wait forever for the "next" iteration. When generation finishes:
 
 1. The iterator is still waiting for more iterations
 2. NNsight issues a warning (not an error)
-3. **All code after the iter block is skipped**
+3. **All code after the iter loop is skipped**
 
 ```python
 # WRONG:
 with model.generate("Hello", max_new_tokens=3) as tracer:
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         hidden = model.transformer.h[-1].output.save()
-    
+
     # ⚠️ THIS NEVER EXECUTES!
     final_logits = model.output.save()
 
@@ -635,9 +635,9 @@ print(final_logits)  # NameError: 'final_logits' is not defined
    ```python
    with model.generate("Hello", max_new_tokens=3) as tracer:
        with tracer.invoke():  # First invoker - handles iteration
-           with tracer.iter[:]:
+           for step in tracer.iter[:]:
                hidden = model.transformer.h[-1].output.save()
-       
+
        with tracer.invoke():  # Second invoker - runs after generation
            final_logits = model.output.save()  # Now runs!
    ```
@@ -1068,8 +1068,8 @@ next_token = model.tokenizer.decode(logits.argmax(dim=-1))
 ```python
 with model.trace("Hello", max_tokens=5) as tracer:
     logits = list().save()
-    
-    with tracer.iter[:]:
+
+    for step in tracer.iter[:]:
         logits.append(model.logits.output)
 ```
 
@@ -1091,7 +1091,7 @@ with model.trace("The Eiffel Tower is in", temperature=0.0, top_p=1):
 with model.trace(max_tokens=3) as tracer:
     with tracer.invoke("Hello", temperature=0.8, top_p=0.95):
         samples = list().save()
-        with tracer.iter[:]:
+        for step in tracer.iter[:]:
             samples.append(model.samples.output.item())
 ```
 
@@ -1140,7 +1140,7 @@ with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
     
     # Or iterate over generation steps
     logits = list().save()
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.lm_head.output[0][-1].argmax(dim=-1))
 
 print(model.tokenizer.decode(output[0]))
@@ -1801,8 +1801,8 @@ model2 = NNsight(my_pytorch_model)  # Safe - hooks replaced, not duplicated
 | `tracer.barrier(n)` | Synchronization barrier |
 | `tracer.cache(...)` | Activation caching |
 | `tracer.stop()` | Early termination |
-| `tracer.iter[slice]` | Iterate generation steps |
-| `tracer.all()` | Apply to all steps |
+| `tracer.iter[slice]` | Iterate generation steps (use as `for step in tracer.iter[:]`) |
+| `tracer.all()` | Apply to all steps (use as `for step in tracer.all()`) |
 | `tracer.result` | Get final output of traced function |
 
 ### Module Properties

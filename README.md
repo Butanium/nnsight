@@ -220,7 +220,7 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
     logits = list().save()
     
     # Iterate over all generation steps
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.lm_head.output[0][-1].argmax(dim=-1))
 
 print(model.tokenizer.batch_decode(logits))
@@ -232,10 +232,10 @@ print(model.tokenizer.batch_decode(logits))
 with model.generate("Hello", max_new_tokens=5) as tracer:
     outputs = list().save()
     
-    with tracer.iter[:] as step_idx:
+    for step_idx in tracer.iter[:]:
         if step_idx == 2:
             model.transformer.h[0].output[0][:] = 0  # Only on step 2
-        
+
         outputs.append(model.transformer.h[-1].output[0])
 ```
 
@@ -243,7 +243,7 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
 > ```python
 > with model.generate("Hello", max_new_tokens=3) as tracer:
 >     with tracer.invoke():  # First invoker
->         with tracer.iter[:]:
+>         for step in tracer.iter[:]:
 >             hidden = model.transformer.h[-1].output.save()
 >     with tracer.invoke():  # Second invoker - runs after
 >         final = model.output.save()  # Now works!
@@ -363,7 +363,7 @@ model = VLLM("gpt2", tensor_parallel_size=1, dispatch=True)
 with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
     logits = list().save()
     
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.logits.output)
 ```
 
@@ -489,7 +489,7 @@ print(model)
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `OutOfOrderError: Value was missed...` | Accessed modules in wrong order | Access modules in forward-pass execution order |
-| `NameError` after `tracer.iter[:]` | Code after unbounded iter doesn't run | Use separate `tracer.invoke()` for post-iteration code |
+| `NameError` after `for step in tracer.iter[:]` | Code after unbounded iter doesn't run | Use separate `tracer.invoke()` for post-iteration code |
 | `ValueError: Cannot return output of Envoy...` | No input provided to trace | Provide input: `model.trace(input)` or use `tracer.invoke(input)` |
 
 For more debugging tips, see the [documentation](https://www.nnsight.net).

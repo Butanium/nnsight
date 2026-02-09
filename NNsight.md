@@ -1426,9 +1426,9 @@ By default, `iteration = 0`, meaning the Mediator requests the first call to eac
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
     logits = list().save()
-    
+
     # Iterate over ALL generation steps
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.lm_head.output.save())
 ```
 
@@ -1441,7 +1441,7 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
 | `tracer.iter[1:4]` | Steps 1, 2, 3 |
 | `tracer.iter[::2]` | Every other step |
 
-When you enter a `with tracer.iter[...]` block, it:
+When you use `for step in tracer.iter[...]`, it:
 
 1. Sets the Mediator's iteration to `None` (unbounded) or specific values
 2. Loops, advancing the iteration cursor each time
@@ -1451,7 +1451,7 @@ When you enter a `with tracer.iter[...]` block, it:
 
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.all():
+    for step in tracer.all():
         # Runs for every generation step
         model.transformer.h[0].output[0][:] = 0
 ```
@@ -1478,11 +1478,11 @@ with model.generate("Hello", max_new_tokens=3) as tracer:
 
 #### Step Index in Iteration
 
-The `with tracer.iter[:] as step_idx` pattern provides the current step:
+The `for step_idx in tracer.iter[:]` pattern provides the current step:
 
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[:] as step_idx:
+    for step_idx in tracer.iter[:]:
         if step_idx == 2:
             # Only intervene on step 2
             model.transformer.h[0].output[0][:] = 0
@@ -1501,9 +1501,9 @@ When you use an unbounded iterator (`iter[:]`, `iter[start:]`, or `all()`), the 
 ```python
 # FOOTGUN EXAMPLE:
 with model.generate("Hello", max_new_tokens=3) as tracer:
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         hidden = model.transformer.h[-1].output.save()
-    
+
     # ⚠️ WARNING: This line NEVER executes!
     final_logits = model.output.save()
 
@@ -1512,7 +1512,7 @@ print(hidden)       # Works - defined inside iter
 print(final_logits) # NameError: 'final_logits' is not defined!
 ```
 
-**Why this happens:** The unbounded iterator keeps waiting for iteration 4, 5, 6... but generation stopped after 3 tokens. The code after the `with tracer.iter[:]` block never runs.
+**Why this happens:** The unbounded iterator keeps waiting for iteration 4, 5, 6... but generation stopped after 3 tokens. The code after the `for step in tracer.iter[:]` loop never runs.
 
 **Solutions:**
 
@@ -1520,9 +1520,9 @@ print(final_logits) # NameError: 'final_logits' is not defined!
    ```python
    with model.generate("Hello", max_new_tokens=3) as tracer:
        with tracer.invoke():  # First invoker - handles iteration
-           with tracer.iter[:]:
+           for step in tracer.iter[:]:
                hidden = model.transformer.h[-1].output.save()
-       
+
        with tracer.invoke():  # Second invoker - runs after generation
            final_logits = model.output.save()  # Now runs!
    ```
@@ -1532,7 +1532,7 @@ print(final_logits) # NameError: 'final_logits' is not defined!
 
 2. **Use bounded iteration** (if you know the count):
    ```python
-   with tracer.iter[:3]:  # Explicitly stop after 3 iterations
+   for step in tracer.iter[:3]:  # Explicitly stop after 3 iterations
        hidden = model.transformer.h[-1].output.save()
    
    final_logits = model.output.save()  # Now runs!
@@ -2344,9 +2344,9 @@ The `.generate()` method works as a tracing context:
 
 ```python
 with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits = model.lm_head.output.save()
-    
+
     output = tracer.result.save()
 ```
 
@@ -2404,9 +2404,9 @@ model = DiffusionModel("stabilityai/stable-diffusion-2-1")
 
 with model.generate("A cat sitting on a mat", num_inference_steps=50) as tracer:
     # Access UNet at each denoising step
-    with tracer.iter[:] as step:
+    for step in tracer.iter[:]:
         unet_out = model.unet.output.save()
-    
+
     output = tracer.result.save()
 
 output.images[0].save("cat.png")
@@ -2419,8 +2419,8 @@ The `num_inference_steps` parameter sets the iteration count:
 ```python
 with model.generate("A landscape", num_inference_steps=30) as tracer:
     noise_preds = list().save()
-    
-    with tracer.iter[:] as step:
+
+    for step in tracer.iter[:]:
         # Intervene on specific steps
         if step < 10:
             # Early denoising - high-level structure
@@ -2487,10 +2487,10 @@ model = VLLM("gpt2", tensor_parallel_size=1, dispatch=True)
 
 with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
     logits = list().save()
-    
-    with tracer.iter[:]:
+
+    for step in tracer.iter[:]:
         logits.append(model.logits.output)
-    
+
     output = tracer.result.save()
 
 print(output)
@@ -2648,10 +2648,10 @@ Like `Generator` in LanguageModel, VLLM has wrapper modules for key outputs:
 
 ```python
 with model.trace("Hello", max_tokens=5) as tracer:
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         # Access logits at each step
         step_logits = model.logits.output.save()
-        
+
         # Access sampled tokens
         tokens = model.samples.output.save()
 ```
@@ -3496,7 +3496,7 @@ In local execution, `.save()` marks values to persist after the trace. In remote
 # WRONG: Local list won't be updated
 logits_l = list()
 with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
-    with tracer.all():
+    for step in tracer.all():
         logits_l.append(model.lm_head.output[0].save())
     print(f"List length is {len(logits_l)}")  # Shows 5 on server
 
@@ -3511,7 +3511,7 @@ The list is populated on the server, but the local `logits_l` is never updated.
 # CORRECT: Create list inside trace and save it
 with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
     logits_l = list().save()  # Create inside trace
-    with tracer.all():
+    for step in tracer.all():
         logits_l.append(model.lm_head.output[0].save())
 
 assert len(logits_l) == 5  # Works!

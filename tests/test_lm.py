@@ -830,12 +830,12 @@ class TestIteration:
         """Test tracer.iter and tracer.all() equivalence."""
         with gpt2.generate(MSG_prompt, max_new_tokens=3) as tracer:
             logits_all = list().save()
-            with tracer.all():
+            for step in tracer.all():
                 logits_all.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
         with gpt2.generate(MSG_prompt, max_new_tokens=3) as tracer:
             logits_iter = list().save()
-            with tracer.iter[:]:
+            for step in tracer.iter[:]:
                 logits_iter.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
         assert len(logits_all) == 3
@@ -845,11 +845,22 @@ class TestIteration:
         assert gpt2.tokenizer.batch_decode(logits_iter) == [" New York City"]
 
     @torch.no_grad()
+    def test_iter_with_block(self, gpt2: nnsight.LanguageModel, MSG_prompt: str):
+        """Test that the with-block iter syntax still works."""
+        with gpt2.generate(MSG_prompt, max_new_tokens=3) as tracer:
+            logits = list().save()
+            with tracer.iter[:]:
+                logits.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
+
+        assert len(logits) == 3
+        assert gpt2.tokenizer.batch_decode(logits) == [" New York City"]
+
+    @torch.no_grad()
     def test_iter_slice(self, gpt2: nnsight.LanguageModel, MSG_prompt: str):
         """Test iteration with slice."""
         with gpt2.generate(MSG_prompt, max_new_tokens=5) as tracer:
             logits = list().save()
-            with tracer.iter[1:3]:
+            for step in tracer.iter[1:3]:
                 logits.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
         assert len(logits) == 2
@@ -860,16 +871,16 @@ class TestIteration:
         """Test iteration with index."""
         with gpt2.generate(MSG_prompt, max_new_tokens=3) as tracer:
             hs = list().save()
-            with tracer.iter[0]:
+            for step in tracer.iter[0]:
                 hs.append(gpt2.transformer.h[0].output[0])
-            with tracer.iter[1]:
+            for step in tracer.iter[1]:
                 hs.append(gpt2.transformer.h[1].output[0])
-            with tracer.iter[2]:
+            for step in tracer.iter[2]:
                 hs.append(gpt2.transformer.h[2].output[0])
 
         with gpt2.generate(MSG_prompt, max_new_tokens=3) as tracer:
             hs_2 = list().save()
-            with tracer.iter[:3] as idx:
+            for idx in tracer.iter[:3]:
                 hs_2.append(gpt2.transformer.h[idx].output[0])
 
         assert all([torch.equal(h, h_2) for h, h_2 in zip(hs, hs_2)])
@@ -880,12 +891,12 @@ class TestIteration:
         with gpt2.generate(max_new_tokens=5) as tracer:
             with tracer.invoke(MSG_prompt):
                 logits_1 = list().save()
-                with tracer.iter[1:3]:
+                for step in tracer.iter[1:3]:
                     logits_1.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
             with tracer.invoke(MSG_prompt):
                 logits_2 = list().save()
-                with tracer.iter[:3]:
+                for step in tracer.iter[:3]:
                     logits_2.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
         assert len(logits_1) == 2
@@ -900,7 +911,7 @@ class TestIteration:
         with gpt2.generate("_", max_new_tokens=3) as tracer:
             arr_gen = list().save()
 
-            with tracer.iter[:] as it:
+            for it in tracer.iter[:]:
                 if it != 1:
                     arr_gen.append(gpt2.transformer.h[1].output[0])
                 else:
@@ -927,7 +938,7 @@ class TestIteration:
                 out = gpt2.transformer.h[0].output[0].clone().save()
 
             with tracer.invoke():
-                with tracer.iter[0]:
+                for step in tracer.iter[0]:
                     gpt2.transformer.h[0].output[0][:] = 0
 
             with tracer.invoke():
@@ -943,7 +954,7 @@ class TestIteration:
         with gpt2.generate("_", max_new_tokens=5) as tracer:
             out = gpt2.transformer.h[0].output[0].clone().save()
 
-            with tracer.iter[2:4]:
+            for step in tracer.iter[2:4]:
                 logits.append(gpt2.lm_head.output.save())
 
         assert isinstance(out, torch.Tensor)
@@ -957,12 +968,12 @@ class TestIteration:
         with gpt2.generate(max_new_tokens=3) as tracer:
             with tracer.invoke(ET_prompt):
                 logits_1 = list().save()
-                with tracer.iter[:]:
+                for step in tracer.iter[:]:
                     logits_1.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
             with tracer.invoke(MSG_prompt):
                 logits_2 = list().save()
-                with tracer.iter[0:3]:
+                for step in tracer.iter[0:3]:
                     logits_2.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
         assert all(
@@ -977,7 +988,7 @@ class TestIteration:
         """Test iteration accessing different layers."""
         with gpt2.trace(MSG_prompt, max_new_tokens=3) as tracer:
             logits = list()
-            with tracer.iter[:]:
+            for step in tracer.iter[:]:
                 logits.append(gpt2.lm_head.output[0][-1].argmax(dim=-1))
 
 
@@ -1333,11 +1344,11 @@ class TestMiscellaneous:
             strm = list()
             strm.save()
 
-            with tracer.iter[2:6]:
+            for step in tracer.iter[2:6]:
                 hs.append(gpt2.transformer.h[-2].output[0])
                 strm.append(gpt2.generator.streamer.output)
 
-            with tracer.iter[6:8]:
+            for step in tracer.iter[6:8]:
                 hs.append(gpt2.transformer.h[-2].output[0])
                 strm.append(gpt2.generator.streamer.output)
 
@@ -1355,11 +1366,11 @@ class TestMiscellaneous:
 
             strm.append(gpt2.generator.streamer.output)
 
-            with tracer.iter[2:6]:
+            for step in tracer.iter[2:6]:
                 hs.append(gpt2.transformer.h[-2].output[0])
                 strm.append(gpt2.generator.streamer.output)
 
-            with tracer.iter[6:8]:
+            for step in tracer.iter[6:8]:
                 hs.append(gpt2.transformer.h[-2].output[0])
                 strm.append(gpt2.generator.streamer.output)
 

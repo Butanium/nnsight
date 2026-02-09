@@ -391,13 +391,13 @@ class Interleaver:
                 if isinstance(requester, tuple):
                     requester = requester[0]
 
+                iteration = mediator.iteration
+
                 mediator.respond(
                     ValueError(
                         f"Execution complete but `{requester}` was not provided. Did you call an Envoy out of order? Investigate why this module was not called."
                     )
                 )
-
-                iteration = mediator.iteration
 
                 if iteration != 0:
                     try:
@@ -651,7 +651,9 @@ class Mediator:
         # Only copy globals that the intervention code actually references.
         all_globals = self.intervention.__globals__
         co_names = self.intervention.__code__.co_names
-        self.original_globals = {k: all_globals[k] for k in co_names if k in all_globals}
+        self.original_globals = {
+            k: all_globals[k] for k in co_names if k in all_globals
+        }
 
         self.cross_invoker = (
             len(self.interleaver.mediators) > 1 and CONFIG.APP.CROSS_INVOKER

@@ -199,10 +199,6 @@ class Tracer:
 
         self.asynchronous = False
 
-        # If no pre-existing info, attempt to capture the code block
-        if self.info is None:
-            self.capture()
-
     # === Core Tracing Methods ===
 
     def capture(self):

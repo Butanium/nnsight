@@ -185,6 +185,7 @@ def wrap_backward(func):
         try:
 
             tracer = BackwardsTracer(tensor, func, *args, **kwargs)
+            tracer.capture()
 
         except WithBlockNotFoundError:
 

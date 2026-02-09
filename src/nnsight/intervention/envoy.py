@@ -1070,9 +1070,12 @@ class Envoy(Batchable):
 
                 def trace(*args, **kwargs):
                     try:
-                        return self.trace(*args, fn=value, **kwargs)
-
+                        tracer = self.trace(*args, fn=value, **kwargs)
+                        tracer.capture()
+                        return tracer
                     except WithBlockNotFoundError as e:
+
+                        args, kwargs, _ = self._prepare_input(*args, **kwargs)
 
                         return value(*args, **kwargs)
 
