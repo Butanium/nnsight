@@ -32,6 +32,12 @@ def pytest_addoption(parser):
         default=1,
         help="Tensor parallel size for VLLM tests (default: 1)",
     )
+    parser.addoption(
+        "--test-flux",
+        action="store_true",
+        default=False,
+        help="Run optional Flux diffusion model tests (requires GPU and model download)",
+    )
 
 
 def pytest_generate_tests(metafunc):
@@ -143,6 +149,48 @@ def dummy_image():
     from PIL import Image
 
     return Image.new("RGB", (64, 64), color=(128, 64, 32))
+
+
+# =============================================================================
+# Test Collection Configuration
+# =============================================================================
+
+# =============================================================================
+# Diffusion Model Fixtures
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def tiny_sd(device: str):
+    """Load a tiny stable diffusion model for testing."""
+    from nnsight import DiffusionModel
+
+    return DiffusionModel(
+        "hf-internal-testing/tiny-stable-diffusion-pipe",
+        safety_checker=None,
+        dispatch=True,
+    ).to(device)
+
+
+@pytest.fixture
+def sd_prompt():
+    """Simple prompt for diffusion model tests."""
+    return "A photo of a cat"
+
+
+@pytest.fixture(scope="module")
+def flux(device: str, request):
+    """Load FLUX.1-schnell model for testing. Requires --test-flux flag."""
+    if not request.config.getoption("--test-flux"):
+        pytest.skip("Flux tests require --test-flux flag")
+
+    from nnsight import DiffusionModel
+
+    return DiffusionModel(
+        "black-forest-labs/FLUX.1-schnell",
+        torch_dtype=torch.bfloat16,
+        dispatch=True,
+    ).to(device)
 
 
 # =============================================================================
