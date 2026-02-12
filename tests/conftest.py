@@ -121,6 +121,31 @@ def gpt2(device: str):
 
 
 # =============================================================================
+# Vision Language Model Fixtures
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def vlm(device: str):
+    """Load a small VLM (LLaVA-Interleave-Qwen-0.5B) with nnsight."""
+    import nnsight
+
+    return nnsight.VisionLanguageModel(
+        "llava-hf/llava-interleave-qwen-0.5b-hf",
+        device_map=device,
+        dispatch=True,
+    )
+
+
+@pytest.fixture
+def dummy_image():
+    """Create a small dummy PIL image for VLM tests."""
+    from PIL import Image
+
+    return Image.new("RGB", (64, 64), color=(128, 64, 32))
+
+
+# =============================================================================
 # Test Collection Configuration
 # =============================================================================
 
