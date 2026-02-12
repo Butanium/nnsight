@@ -12,6 +12,17 @@ def rebuild(state):
 
 
 class NNsightSamplingParams(SamplingParams):
+    """Extended vLLM ``SamplingParams`` that carries a serialized :class:`Mediator`.
+
+    When sent to a vLLM worker, the mediator is serialized via
+    :func:`save` so the worker can deserialize it and run the
+    user's intervention code alongside model execution.
+
+    Attributes:
+        mediator (Optional[Mediator | bytes]): The mediator instance
+            (or its serialized bytes) for this request.
+    """
+
     mediator: Optional[Mediator | bytes] = None
 
     def __reduce__(self):

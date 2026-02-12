@@ -15,6 +15,18 @@ from .meta import MetaMixin
 
 
 class RemoteableMixin(MetaMixin):
+    """Mixin that adds remote execution support via NDIF.
+
+    Extends :class:`MetaMixin` with ``remote`` and ``backend``
+    parameters on :meth:`trace` and :meth:`session`, enabling
+    interventions to be serialized and executed on remote
+    infrastructure.
+
+    Subclasses must implement :meth:`_remoteable_model_key` (returns a
+    string identifying the model for the remote server) and
+    :meth:`_remoteable_from_model_key` (reconstructs the wrapper from
+    that key on the server side).
+    """
 
     def trace(
         self,
@@ -24,6 +36,24 @@ class RemoteableMixin(MetaMixin):
         blocking: bool = True,
         **kwargs: Dict[str, Any],
     ):
+        """Open a tracing context for a single forward pass.
+
+        Extends the base :meth:`trace` with remote execution options.
+
+        Args:
+            *inputs: Model inputs (strings, tensors, etc.).
+            backend (Union[Backend, str, None]): Explicit backend
+                instance or a URL string for a :class:`RemoteBackend`.
+            remote (Union[bool, str]): ``True`` to execute on NDIF,
+                ``'local'`` for local simulation, or ``False`` (default)
+                for local execution.
+            blocking (bool): If ``True`` (default), block until the
+                remote job completes.
+            **kwargs: Forwarded to the underlying trace.
+
+        Returns:
+            A tracing context manager.
+        """
 
         if backend is not None:
             pass
@@ -51,6 +81,17 @@ class RemoteableMixin(MetaMixin):
         blocking: bool = True,
         **kwargs: Dict[str, Any],
     ):
+        """Open a session context grouping multiple traces.
+
+        Args:
+            *inputs: Inputs forwarded to the underlying session.
+            backend (Union[Backend, str, None]): Explicit backend
+                instance or a URL string for a :class:`RemoteBackend`.
+            remote (bool): If ``True``, execute on NDIF.
+            blocking (bool): If ``True`` (default), block until the
+                remote job completes.
+            **kwargs: Forwarded to the underlying session.
+        """
 
         if backend is not None:
             pass
@@ -69,6 +110,7 @@ class RemoteableMixin(MetaMixin):
         )
 
     def _remoteable_persistent_objects(self) -> dict:
+        """Return objects that must persist across serialization for remote execution."""
 
         persistent_objects = {"Interleaver": self._interleaver}
 
@@ -78,13 +120,26 @@ class RemoteableMixin(MetaMixin):
         return persistent_objects
 
     def _remoteable_model_key(self) -> str:
+        """Return a string that uniquely identifies this model for the remote server.
+
+        Must be implemented by subclasses.
+        """
         raise NotImplementedError()
 
     @classmethod
     def _remoteable_from_model_key(cls, model_key: str) -> Self:
+        """Reconstruct a model wrapper from a model key on the server side.
+
+        Must be implemented by subclasses.
+        """
         raise NotImplementedError()
 
     def to_model_key(self) -> str:
+        """Build a fully-qualified model key including the class import path.
+
+        The key has the form ``"import.path.ClassName:model_specific_key"``
+        and is used by NDIF to locate and reconstruct the model on the server.
+        """
 
         import_path = f"{self._remoteable_model_key.__func__.__module__}.{self._remoteable_model_key.__func__.__qualname__.split('.')[0]}"
 
@@ -92,6 +147,15 @@ class RemoteableMixin(MetaMixin):
 
     @classmethod
     def from_model_key(cls, model_key: str, **kwargs) -> Self:
+        """Reconstruct a model wrapper from a fully-qualified model key.
+
+        Parses the import path, imports the correct class, and delegates
+        to :meth:`_remoteable_from_model_key`.
+
+        Args:
+            model_key (str): Key in the form ``"import.path:model_key"``.
+            **kwargs: Additional arguments forwarded to the class constructor.
+        """
 
         import_path, model_key = model_key.split(":", 1)
 
@@ -101,6 +165,11 @@ class RemoteableMixin(MetaMixin):
 
 
 class StreamTracer(Tracer):
+    """Tracer that serializes intervention code, sends it to a remote server, and injects results back into the caller's frame.
+
+    Used by :meth:`RemoteTracer.local` to enable hybrid local/remote
+    execution within a remote session.
+    """
 
     _send: Callable = None
     _recv: Callable = None
@@ -112,12 +181,14 @@ class StreamTracer(Tracer):
 
     @classmethod
     def register(cls, send_fn: Callable, recv_fn: Callable):
+        """Register the send/receive callables used for remote communication."""
 
         cls._send = send_fn
         cls._recv = recv_fn
 
     @classmethod
     def deregister(cls):
+        """Clear the registered send/receive callables."""
 
         cls._send = None
         cls._recv = None
@@ -158,6 +229,7 @@ class StreamTracer(Tracer):
 
 
 class RemoteTracer(Tracer):
+    """Tracer used inside remote sessions that supports hybrid local/remote execution."""
 
     def local(self):
 
@@ -167,4 +239,11 @@ class RemoteTracer(Tracer):
 
 
 class RemoteInterleavingTracer(InterleavingTracer, RemoteTracer):
+    """Interleaving tracer with remote execution capabilities.
+
+    Combines :class:`InterleavingTracer` (thread-based interleaving) with
+    :class:`RemoteTracer` (remote/hybrid support) for use in
+    ``model.trace(remote=True)``.
+    """
+
     pass

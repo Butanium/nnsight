@@ -5,6 +5,12 @@ from vllm.v1.worker import gpu_model_runner
 
 
 class NNsightGPUWorker(gpu_worker.Worker):
+    """Custom vLLM GPU worker that uses :class:`NNsightGPUModelRunner`.
+
+    Monkey-patches the default ``GPUModelRunner`` class before
+    initialization so vLLM creates NNsight-aware model runners
+    that can execute intervention code during model forward passes.
+    """
 
     def __init__(self, *args, **kwargs):
 

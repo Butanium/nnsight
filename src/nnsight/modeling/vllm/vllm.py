@@ -159,6 +159,15 @@ class VLLM(RemoteableMixin):
     def _prepare_input(
         self, *args, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
+        """Normalize user inputs into ``((prompts, params), kwargs, batch_size)``.
+
+        Accepts strings, token ID lists, or HuggingFace tokenizer
+        outputs and converts them into vLLM-compatible prompt objects
+        with :class:`NNsightSamplingParams`.
+
+        Returns:
+            Tuple of ``((prompts, params), kwargs, batch_size)``.
+        """
 
         prompts = []
         params = []
@@ -224,6 +233,7 @@ class VLLM(RemoteableMixin):
     def _batch(
         self, batched_inputs, prompts, params, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
+        """Combine multiple invokes' prompts and sampling params into a single batch."""
 
         kwargs = {**kwargs, **batched_inputs[1]}
 
@@ -245,6 +255,12 @@ class VLLM(RemoteableMixin):
         params: List[NNsightSamplingParams],
         **kwargs,
     ) -> Any:
+        """Execute vLLM generation with NNsight interventions.
+
+        Attaches mediators to sampling params so the vLLM workers can
+        deserialize and run intervention code, then collects saved
+        variables from the outputs.
+        """
 
         default_param = NNsightSamplingParams.from_optional()
 
@@ -310,9 +326,3 @@ class VLLM(RemoteableMixin):
         finally:
             self._interleaver.check_cache_full()
             self._interleaver.cancel()
-
-
-if TYPE_CHECKING:
-
-    class VLLM(VLLM, LLM):
-        pass

@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 
 
 class NNsightGPUModelRunner(GPUModelRunner):
+    """Custom vLLM GPU model runner that interleaves NNsight interventions with model execution.
+
+    Wraps the model with an NNsight :class:`Envoy`, deserializes
+    mediators from incoming :class:`NNsightSamplingParams`, and manages
+    batch group mappings so each invoke's intervention code sees the
+    correct slice of the batch.
+    """
 
     class NNsightRequestHelper:
         """

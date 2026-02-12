@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from transformers import (
@@ -10,14 +10,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BatchEncoding,
-    PreTrainedModel,
     PreTrainedTokenizer,
 )
-from transformers.generation.utils import GenerationMixin
-
 
 from ..intervention.envoy import Envoy
-from ..intervention.tracing.tracer import InterleavingTracer
 from ..util import WrapperModule
 from .transformers import TransformersModel
 
@@ -46,8 +42,16 @@ class LanguageModel(TransformersModel):
     """
 
     class Generator(WrapperModule):
+        """Wrapper module that captures the final generation output.
+
+        Contains a :class:`Streamer` submodule that receives tokens
+        during generation. The generator output can be accessed via
+        ``model.generator.output`` inside a trace, though
+        ``tracer.result`` is preferred for new code.
+        """
 
         class Streamer(WrapperModule):
+            """Streamer that receives tokens during generation and passes them through as a module call."""
 
             def put(self, *args):
                 return self(*args)
@@ -134,6 +138,12 @@ class LanguageModel(TransformersModel):
             setattr(generation_config, "compile_config", compile_config)
 
     def __nnsight_generate__(self, *args, **kwargs):
+        """Custom generation entry point used when ``.generate()`` is called as a tracing context.
+
+        Sets up iteration tracking via ``max_new_tokens``, injects a
+        streamer for token-by-token access, and wraps the final output
+        through the :attr:`generator` module.
+        """
 
         max_new_tokens = kwargs.get("max_new_tokens", None)
 
@@ -178,6 +188,9 @@ class LanguageModel(TransformersModel):
         ],
         **kwargs,
     ):
+        """
+        Tokenizes the inputs.
+        """
 
         if isinstance(inputs, torch.Tensor):
             if inputs.ndim == 1:
@@ -245,6 +258,15 @@ class LanguageModel(TransformersModel):
         attention_mask: Any = None,
         **kwargs,
     ) -> tuple[tuple[Any], dict[str, Any], int]:
+        """Normalize user inputs into a ``(args, kwargs, batch_size)`` tuple.
+
+        Handles tokenization of strings, tensor reshaping, and
+        separation of tokenizer-specific kwargs from model kwargs.
+
+        Returns:
+            Tuple of ``(args, kwargs, batch_size)`` ready for the
+            model's forward pass or for :meth:`_batch`.
+        """
 
         tokenizer_kwargs = {}
         remaining_kwargs = {}
@@ -289,6 +311,14 @@ class LanguageModel(TransformersModel):
         batched_inputs: Optional[Tuple[Tuple[BatchEncoding], Dict[str, Any]]],
         **prepared_kwargs,
     ) -> tuple[tuple[Any], dict[str, Any]]:
+        """Combine multiple invokes' prepared inputs into a single padded batch.
+
+        Re-pads token sequences so they share a common length and
+        preserves attention masks from earlier invokes.
+
+        Returns:
+            Tuple of ``(args, kwargs)`` representing the combined batch.
+        """
 
         batched_inputs = batched_inputs[1]
 
@@ -353,11 +383,3 @@ class LanguageModel(TransformersModel):
     def __setstate__(self, state):
         super().__setstate__(state)
         self.tokenizer = state["tokenizer"]
-
-
-if TYPE_CHECKING:
-
-    class LanguageModel(GenerationMixin, LanguageModel, PreTrainedModel):
-
-        def generate(self, *args, **kwargs) -> Union[InterleavingTracer, Any]:
-            return super().generate(*args, **kwargs)

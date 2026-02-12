@@ -6,6 +6,12 @@ from vllm import envs
 
 
 class NNsightLLMEngine(LLMEngine):
+    """Custom vLLM engine that collects saved intervention results from finished requests.
+
+    After each engine step, finished requests are forwarded to the
+    model runner's ``finish_nnsight()`` method to gather any variables
+    that were ``.save()``-ed during intervention execution.
+    """
 
     def step(self):
 
