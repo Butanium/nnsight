@@ -10,10 +10,14 @@ These tests cover diffusion model specific features:
 - Iteration over generation steps
 - Seed reproducibility
 - Non-tracing forward pass
+- Meta loading (dispatch=False)
 - Flux (transformer-based) pipeline support (optional, --test-flux)
 """
 
 import pytest
+
+pytest.importorskip("diffusers")
+
 import torch
 import PIL
 import numpy as np
@@ -206,6 +210,55 @@ class TestDiffusionTextOnly:
         assert len(output.images) >= 1
         for img in output.images:
             assert isinstance(img, PIL.Image.Image)
+
+
+# =============================================================================
+# Meta Loading Tests (dispatch=False)
+# =============================================================================
+
+
+class TestDiffusionMetaLoading:
+    """Tests for dispatch=False meta loading path."""
+
+    def test_meta_loading_creates_meta_params(self):
+        """dispatch=False creates model with meta-device parameters (no weights downloaded)."""
+        model = DiffusionModel(
+            "hf-internal-testing/tiny-stable-diffusion-pipe",
+            safety_checker=None,
+            dispatch=False,
+        )
+
+        # Model should exist and have a UNet
+        assert model._model is not None
+        assert hasattr(model._model, "unet")
+
+        # Parameters should be on the meta device (no real weights)
+        for param in model._model.unet.parameters():
+            assert param.device.type == "meta"
+
+    @torch.no_grad()
+    def test_meta_loading_auto_dispatches_on_trace(self, sd_prompt):
+        """dispatch=False model auto-dispatches real weights on first trace."""
+        model = DiffusionModel(
+            "hf-internal-testing/tiny-stable-diffusion-pipe",
+            safety_checker=None,
+            dispatch=False,
+        )
+
+        # Verify meta device before trace
+        for param in model._model.unet.parameters():
+            assert param.device.type == "meta"
+
+        # Trace should trigger auto-dispatch and produce valid output
+        with model.trace(sd_prompt) as tracer:
+            output = tracer.result.save()
+
+        assert hasattr(output, "images")
+        assert len(output.images) >= 1
+
+        # After trace, parameters should no longer be on meta device
+        for param in model._model.unet.parameters():
+            assert param.device.type != "meta"
 
 
 # =============================================================================

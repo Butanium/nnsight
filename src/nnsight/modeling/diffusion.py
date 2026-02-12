@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import inspect
 from typing import Any, Dict, List, Optional, Union
 
@@ -13,6 +14,115 @@ from .huggingface import HuggingFaceModel
 from typing import Type
 
 
+def _resolve_component_cls(lib_name: str, cls_name: str):
+    """Resolve a pipeline component class from its library and class name.
+
+    The ``model_index.json`` config stores each component as
+    ``[library_name, class_name]``.  Library names can be ``"diffusers"``,
+    ``"transformers"``, or a diffusers pipeline subpackage name like
+    ``"stable_diffusion"``.
+
+    If the class name starts with ``"Flax"`` or ``"TF"`` (JAX/TensorFlow
+    variants), this function strips the prefix and resolves the
+    corresponding PyTorch class instead.
+
+    Returns:
+        The resolved class, or ``None`` if it cannot be found.
+    """
+    import diffusers as _diffusers
+    import transformers as _transformers
+
+    # Normalize Flax/TF class names to their PyTorch equivalents
+    for prefix in ("Flax", "TF"):
+        if cls_name.startswith(prefix):
+            cls_name = cls_name[len(prefix):]
+            break
+
+    if lib_name == "diffusers":
+        return getattr(_diffusers, cls_name, None)
+    elif lib_name == "transformers":
+        return getattr(_transformers, cls_name, None)
+    else:
+        try:
+            mod = importlib.import_module(f"diffusers.pipelines.{lib_name}")
+            return getattr(mod, cls_name, None)
+        except (ImportError, RuntimeError):
+            return None
+
+
+def _build_pipeline_from_config(
+    automodel: type,
+    repo_id: str,
+    revision: Optional[str] = None,
+    **kwargs,
+) -> DiffusionPipeline:
+    """Build a diffusion pipeline with meta-device ``nn.Module`` components.
+
+    Downloads only the pipeline's ``model_index.json`` config and each
+    component's ``config.json`` (a few KB total).  Each ``nn.Module``
+    component is instantiated from its config — no pretrained weights
+    are downloaded.  Non-module components (tokenizers, schedulers,
+    feature extractors) are set to ``None``.
+
+    This is called inside ``init_empty_weights()`` by
+    :meth:`DiffusionModel._load_meta`, so all created parameters land
+    on the ``meta`` device.
+
+    Args:
+        automodel: The pipeline class (e.g. ``DiffusionPipeline``).
+        repo_id: HuggingFace repository ID.
+        revision: Git revision / branch / tag.
+        **kwargs: User overrides (e.g. ``safety_checker=None``).
+
+    Returns:
+        A pipeline instance with meta-device module components.
+    """
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig
+
+    config = automodel.load_config(repo_id, revision=revision)
+
+    pipe_cls_name = config.get("_class_name", automodel.__name__)
+    pipe_cls = getattr(pipelines, pipe_cls_name, automodel)
+
+    components = {}
+    for key, val in config.items():
+        if key.startswith("_"):
+            continue
+
+        lib_name, cls_name = val
+
+        # Honour explicit user overrides (e.g. safety_checker=None)
+        if key in kwargs:
+            components[key] = kwargs.pop(key)
+            continue
+
+        cls = _resolve_component_cls(lib_name, cls_name)
+
+        if cls is None or not (isinstance(cls, type) and issubclass(cls, torch.nn.Module)):
+            components[key] = None
+            continue
+
+        # Create meta-device component from its config
+        try:
+            if hasattr(cls, "load_config"):
+                # Diffusers components (UNet, VAE, Transformer, etc.)
+                sub_cfg = cls.load_config(repo_id, subfolder=key, revision=revision)
+                with init_empty_weights():
+                    components[key] = cls.from_config(sub_cfg)
+            else:
+                # Transformers components (CLIPTextModel, T5, etc.)
+                auto_cfg = AutoConfig.from_pretrained(
+                    repo_id, subfolder=key, revision=revision
+                )
+                with init_empty_weights():
+                    components[key] = cls(auto_cfg)
+        except Exception:
+            components[key] = None
+
+    return pipe_cls(**components, **kwargs)
+
+
 class Diffuser(util.WrapperModule):
     """Wrapper module that loads a diffusion pipeline and exposes its components as submodules.
 
@@ -23,22 +133,32 @@ class Diffuser(util.WrapperModule):
     Diffusion, ``transformer`` for Flux, plus ``vae``, ``text_encoder``,
     etc.).
 
+    Can be constructed in two ways:
+
+    1. **From pretrained** (default): pass a pipeline class and repo ID
+       to download and load full weights via ``from_pretrained()``.
+    2. **From a pre-built pipeline**: pass a ``DiffusionPipeline``
+       instance directly (used by :meth:`DiffusionModel._load_meta`
+       for meta-tensor initialization).
+
     Args:
-        automodel (Type[DiffusionPipeline]): The diffusers pipeline
-            class to use for loading. Defaults to ``DiffusionPipeline``.
-        *args: Forwarded to ``automodel.from_pretrained()``.
-        **kwargs: Forwarded to ``automodel.from_pretrained()``.
+        automodel_or_pipeline: Either a pipeline class
+            (``Type[DiffusionPipeline]``) for ``from_pretrained`` loading,
+            or an already-constructed ``DiffusionPipeline`` instance.
+        *args: Forwarded to ``automodel.from_pretrained()`` when loading.
+        **kwargs: Forwarded to ``automodel.from_pretrained()`` when loading.
 
     Attributes:
         pipeline (DiffusionPipeline): The underlying diffusers pipeline.
     """
 
-    def __init__(
-        self, automodel: Type[DiffusionPipeline] = DiffusionPipeline, *args, **kwargs
-    ) -> None:
+    def __init__(self, automodel_or_pipeline=DiffusionPipeline, *args, **kwargs) -> None:
         super().__init__()
 
-        self.pipeline = automodel.from_pretrained(*args, **kwargs)
+        if isinstance(automodel_or_pipeline, DiffusionPipeline):
+            self.pipeline = automodel_or_pipeline
+        else:
+            self.pipeline = automodel_or_pipeline.from_pretrained(*args, **kwargs)
 
         for key, value in self.pipeline.__dict__.items():
             if isinstance(value, torch.nn.Module) or isinstance(
@@ -71,6 +191,12 @@ class DiffusionModel(HuggingFaceModel):
     ``num_inference_steps=1`` for fast single-step tracing. Use
     ``.generate()`` to run the full pipeline with the default or
     user-specified number of inference steps.
+
+    When ``dispatch=False`` (the default), only lightweight config
+    files are downloaded and the model architecture is created with
+    meta tensors (no memory).  Real weights are loaded automatically
+    on the first ``.trace()`` or ``.generate()`` call, or explicitly
+    via ``.dispatch()``.
 
     Examples::
 
@@ -114,25 +240,26 @@ class DiffusionModel(HuggingFaceModel):
     def _load_meta(self, repo_id: str, revision: Optional[str] = None, **kwargs):
         """Load a meta (placeholder) version of the diffusion model.
 
+        Downloads only the pipeline and component config files (a few KB).
+        Each ``nn.Module`` component is instantiated from its config with
+        meta-device parameters — no pretrained weights are downloaded.
+        Non-module components (tokenizer, scheduler, etc.) are set to
+        ``None`` and will be loaded on :meth:`dispatch`.
+
         Args:
             repo_id: HuggingFace repository ID.
             revision: Git revision of the repository.
-            **kwargs: Forwarded to ``Diffuser()``.
+            **kwargs: User overrides forwarded to pipeline construction
+                (e.g. ``safety_checker=None``).
 
         Returns:
-            A :class:`Diffuser` instance.
+            A :class:`Diffuser` instance with meta-device parameters.
         """
-
-        model = Diffuser(
-            self.automodel,
-            repo_id,
-            revision=revision,
-            device_map=None,
-            low_cpu_mem_usage=False,
-            **kwargs,
+        pipeline = _build_pipeline_from_config(
+            self.automodel, repo_id, revision=revision, **kwargs
         )
 
-        return model
+        return Diffuser(pipeline)
 
     def _load(
         self, repo_id: str, revision: Optional[str] = None, device_map=None, **kwargs
