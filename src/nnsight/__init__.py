@@ -34,8 +34,6 @@ except Exception:
 from functools import wraps
 
 import os
-import warnings
-from typing import Optional
 from .schema.config import ConfigModel
 
 PATH = os.path.dirname(os.path.abspath(__file__))
@@ -62,35 +60,7 @@ except NameError:
 
 __INTERACTIVE__ = (sys.flags.interactive or not sys.argv[0]) and not __IPYTHON__
 
-base_deprecation_message = (
-    "is deprecated as of v0.5.0 and will be removed in a future version."
-)
-
 NNS_VLLM_VERSION = "0.14.1"
-
-
-def deprecated(message: Optional[str] = None, error: bool = False):
-
-    def decorator(func):
-
-        @wraps(func)
-        def inner(*args, **kwargs):
-
-            deprecation_message = (
-                f"{func.__module__}.{func.__name__} {base_deprecation_message}"
-                + (f"\n{message}" if message is not None else "")
-            )
-
-            if error:
-                raise DeprecationWarning(deprecation_message)
-            else:
-                warnings.warn(deprecation_message)
-
-            return func(*args, **kwargs)
-
-        return inner
-
-    return decorator
 
 
 from .intervention.envoy import Envoy
@@ -204,62 +174,6 @@ def wrap_backward(func):
 DEFAULT_PATCHER.add(Patch(Tensor, wrap_backward(Tensor.backward), "backward"))
 
 DEFAULT_PATCHER.__enter__()
-
-
-## TODO: Legacy
-
-
-@deprecated()
-def apply(fn, *args, **kwargs):
-
-    return fn(*args, **kwargs)
-
-
-@deprecated()
-def log(message: str):
-
-    print(message)
-
-
-@deprecated(error=True)
-def local(*args, **kwargs):
-    pass
-
-
-@deprecated(error=True)
-def cond(*args, **kwargs):
-    pass
-
-
-@deprecated(error=True)
-def iter(*args, **kwargs):
-    pass
-
-
-from .intervention.interleaver import EarlyStopException
-
-
-@deprecated()
-def stop():
-    raise EarlyStopException()
-
-
-@deprecated()
-def trace(fn):
-
-    return fn
-
-
-bool = deprecated(message="Use the standard `bool()` instead.")(bool)
-bytes = deprecated(message="Use the standard `bytes()` instead.")(bytes)
-complex = deprecated(message="Use the standard `complex()` instead.")(complex)
-dict = deprecated(message="Use the standard `dict()` instead.")(dict)
-float = deprecated(message="Use the standard `float()` instead.")(float)
-int = deprecated(message="Use the standard `int()` instead.")(int)
-list = deprecated(message="Use the standard `list()` instead.")(list)
-str = deprecated(message="Use the standard `str()` instead.")(str)
-tuple = deprecated(message="Use the standard `tuple()` instead.")(tuple)
-bytearray = deprecated(message="Use the standard `bytearray()` instead.")(bytearray)
 
 if __INTERACTIVE__:
     from code import InteractiveConsole

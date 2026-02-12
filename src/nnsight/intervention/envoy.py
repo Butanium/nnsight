@@ -20,7 +20,7 @@ from typing import (
 import torch
 from torch.nn.modules.module import _addindent
 
-from .. import CONFIG, base_deprecation_message, deprecated, util
+from .. import CONFIG, util
 from ..util import apply
 
 from .batching import Batchable
@@ -418,7 +418,6 @@ class Envoy(Batchable):
         self,
         *args,
         fn: Optional[Callable] = None,
-        trace: bool = None,
         tracer_cls: Type[InterleavingTracer] = InterleavingTracer,
         **kwargs,
     ):
@@ -443,11 +442,6 @@ class Envoy(Batchable):
         Returns:
             An InterleavingTracer for this module
         """
-
-        # TODO trace= is Legacy
-        if trace is not None:
-            deprecation_message = f"The `trace` argument {base_deprecation_message}\nJust call the method without a with context instead."
-            warnings.warn(deprecation_message)
 
         if fn is None:
             fn = self.__call__
@@ -591,21 +585,35 @@ class Envoy(Batchable):
         return tracer
 
     @property
-    @deprecated(message="Use `tracer.iter` instead.")
     @trace_only
     def iter(self):
+        warnings.warn(
+            "model.iter is deprecated and will be removed in a future version. "
+            "Use tracer.iter instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return IteratorProxy(self._interleaver)
 
-    @deprecated(message="Use `tracer.all()` instead.")
     @trace_only
     def all(self):
+        warnings.warn(
+            "model.all() is deprecated and will be removed in a future version. "
+            "Use tracer.all() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.iter[:]
 
-    @deprecated(message="Use `tracer.next()` instead.")
     @trace_only
     def next(self, step: int = 1):
+        warnings.warn(
+            "model.next() is deprecated and will be removed in a future version. "
+            "Use tracer.next() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._interleaver.current.iteration += step
-
         return self
 
     @trace_only

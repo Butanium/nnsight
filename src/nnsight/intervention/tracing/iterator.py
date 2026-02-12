@@ -1,3 +1,4 @@
+import warnings
 from typing import Callable, TYPE_CHECKING, Any, Union
 from .base import Tracer
 from ..backends.execution import ExecutionBackend
@@ -114,6 +115,13 @@ class IteratorTracer(Tracer):
         self.info.start_line -= 1
 
     def execute(self, fn: Callable):
+
+        warnings.warn(
+            "`with tracer.iter[...]:` is deprecated and will be removed in a future version. "
+            "Use `for step in tracer.iter[...]:` instead.",
+            DeprecationWarning,
+            stacklevel=6,
+        )
 
         mediator = self.interleaver.current
 

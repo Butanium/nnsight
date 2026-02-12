@@ -2,7 +2,6 @@ from typing import Any, Callable, Tuple, Union
 
 import torch
 from typing_extensions import Self
-from ... import deprecated
 from ..._c.py_mount import mount
 from ... import CONFIG
 
@@ -38,15 +37,6 @@ class Object(torch.Tensor):
 
         return self
 
-    @deprecated(message="Use `tracer.stop()` instead.")
-    def stop(self, _=0):
-        """
-        Stop the trace context.
-        """
-
-        from ..interleaver import EarlyStopException
-
-        raise EarlyStopException()
 
     def __getattr__(self, name: str) -> Self:
 
@@ -114,7 +104,6 @@ class Globals:
 
         if CONFIG.APP.PYMOUNT and not Globals._mounted:
             mount(Object.save, "save")
-            mount(Object.stop, "stop")
             Globals._mounted = True
         Globals.stack += 1
 

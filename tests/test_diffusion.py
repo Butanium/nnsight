@@ -176,12 +176,12 @@ class TestDiffusionSeed:
     def test_seed_reproducibility(self, tiny_sd, sd_prompt):
         """Same seed produces identical outputs."""
         with tiny_sd.generate(
-            sd_prompt, num_inference_steps=2, seed=42, trace=False
+            sd_prompt, num_inference_steps=2, seed=42
         ) as tracer:
             output1 = tracer.result.save()
 
         with tiny_sd.generate(
-            sd_prompt, num_inference_steps=2, seed=42, trace=False
+            sd_prompt, num_inference_steps=2, seed=42
         ) as tracer:
             output2 = tracer.result.save()
 
@@ -197,13 +197,13 @@ class TestDiffusionSeed:
 
 
 class TestDiffusionTextOnly:
-    """Tests for running the pipeline without internal tracing (trace=False)."""
+    """Tests for running the pipeline without a tracing context."""
 
     @torch.no_grad()
-    def test_generate_trace_false(self, tiny_sd, sd_prompt):
-        """Generate with trace=False produces valid images."""
+    def test_generate_no_context(self, tiny_sd, sd_prompt):
+        """Generate without a with-context produces valid images."""
         output = tiny_sd.generate(
-            sd_prompt, num_inference_steps=2, trace=False
+            sd_prompt, num_inference_steps=2
         )
 
         assert hasattr(output, "images")
