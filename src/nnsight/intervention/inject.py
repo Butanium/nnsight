@@ -126,11 +126,8 @@ def convert(fn: Callable, wrap: Callable, name: str):
     else:
         # Fallback: convert to source if tree structure is unexpected
         code_obj = compile(_ast_to_source(tree), filename, "exec")
-    try:
-        exec(code_obj, global_namespace, local_namespace)
-    except Exception as exc:
-        ee = exc
-        breakpoint()
+
+    exec(code_obj, global_namespace, local_namespace)
 
     fn = local_namespace[fn.__name__]
 
