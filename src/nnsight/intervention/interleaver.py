@@ -6,7 +6,7 @@ import warnings
 import weakref
 from collections import defaultdict
 from enum import Enum
-from functools import wraps
+from functools import partial, wraps
 from threading import Thread
 from types import FrameType
 from typing import (
@@ -214,12 +214,21 @@ class Interleaver:
         if not pre_wrapped:
             # First time wrapping - create skippable forward wrapper
 
-            original_forward = type(module).forward
+            instance_forward = module.forward
+            if hasattr(instance_forward, '__self__'):
+                # Bound method — unbind to avoid reference cycle:
+                # module -> forward -> __self__ -> module
+                original_forward = instance_forward.__func__
+            elif isinstance(instance_forward, partial):
+                # e.g. accelerate's partial(new_forward, module) for device_map —
+                # unwrap to avoid reference cycle through partial.args
+                original_forward = instance_forward.func
+            else:
+                original_forward = instance_forward
+
             module.__nnsight_skip__ = [None]
             skip_container = module.__nnsight_skip__
 
-            # Use weakref to avoid reference cycle:
-            # module -> forward -> __self__ -> module
             module_ref = weakref.ref(module)
 
             @wraps(original_forward)
