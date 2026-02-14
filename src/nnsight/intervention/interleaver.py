@@ -215,7 +215,7 @@ class Interleaver:
             # First time wrapping - create skippable forward wrapper
 
             instance_forward = module.forward
-            if hasattr(instance_forward, '__self__'):
+            if hasattr(instance_forward, "__self__"):
                 # Bound method — unbind to avoid reference cycle:
                 # module -> forward -> __self__ -> module
                 original_forward = instance_forward.__func__
@@ -229,6 +229,8 @@ class Interleaver:
             module.__nnsight_skip__ = [None]
             skip_container = module.__nnsight_skip__
 
+            module.__nnsight_forward__ = original_forward
+
             module_ref = weakref.ref(module)
 
             @wraps(original_forward)
@@ -239,7 +241,7 @@ class Interleaver:
                     # (will be cleared by output hook)
                     return skip_container[0]
 
-                return original_forward(m, *args, **kwargs)
+                return m.__nnsight_forward__(m, *args, **kwargs)
 
             module.forward = nnsight_forward
         else:

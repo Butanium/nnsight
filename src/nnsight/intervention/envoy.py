@@ -392,9 +392,17 @@ class Envoy(Batchable):
                     return fn
 
             source, line_numbers, forward = inject(
-                self._module.forward, wrap, self._module.__path__
+                type(self._module).forward, wrap, self._module.__path__
             )
-            self._module.forward = MethodType(forward, self._module)
+
+            if hasattr(self._module, '_old_forward'):
+                # Accelerate's new_forward calls module._old_forward(*args, **kwargs)
+                self._module._old_forward = MethodType(forward, self._module)
+            elif hasattr(self._module, '__nnsight_forward__'):
+                # nnsight_forward calls m.__nnsight_forward__(m, *args, **kwargs)
+                self._module.__nnsight_forward__ = forward
+            else:
+                self._module.forward = MethodType(forward, self._module)
 
             self._source = EnvoySource(
                 self._module.__path__,
@@ -914,9 +922,16 @@ class Envoy(Batchable):
                     return fn
 
             source, line_numbers, forward = inject(
-                self._module.forward, wrap, self._module.__path__
+                type(self._module).forward, wrap, self._module.__path__
             )
-            self._module.forward = MethodType(forward, self._module)
+
+            if hasattr(self._module, '_old_forward'):
+                self._module._old_forward = MethodType(forward, self._module)
+            elif hasattr(self._module, '__nnsight_forward__'):
+                # nnsight_forward calls m.__nnsight_forward__(m, *args, **kwargs)
+                self._module.__nnsight_forward__ = forward
+            else:
+                self._module.forward = MethodType(forward, self._module)
 
     def _update_alias(self, alias: Dict[str, str]):
         """
