@@ -395,10 +395,10 @@ class Envoy(Batchable):
                 type(self._module).forward, wrap, self._module.__path__
             )
 
-            if hasattr(self._module, '_old_forward'):
+            if hasattr(self._module, "_old_forward"):
                 # Accelerate's new_forward calls module._old_forward(*args, **kwargs)
                 self._module._old_forward = MethodType(forward, self._module)
-            elif hasattr(self._module, '__nnsight_forward__'):
+            elif hasattr(self._module, "__nnsight_forward__"):
                 # nnsight_forward calls m.__nnsight_forward__(m, *args, **kwargs)
                 self._module.__nnsight_forward__ = forward
             else:
@@ -925,9 +925,9 @@ class Envoy(Batchable):
                 type(self._module).forward, wrap, self._module.__path__
             )
 
-            if hasattr(self._module, '_old_forward'):
+            if hasattr(self._module, "_old_forward"):
                 self._module._old_forward = MethodType(forward, self._module)
-            elif hasattr(self._module, '__nnsight_forward__'):
+            elif hasattr(self._module, "__nnsight_forward__"):
                 # nnsight_forward calls m.__nnsight_forward__(m, *args, **kwargs)
                 self._module.__nnsight_forward__ = forward
             else:
@@ -1356,8 +1356,10 @@ class OperationEnvoy:
 
             self._fn = fn
 
-        if f"{self.name}.fn" not in self._interleaver.current.history:
-            self._interleaver.current.swap(f"{self.name}.fn", self._fn)
+        requester = f"{self.name}.fn"
+
+        if requester not in self._interleaver.current.history:
+            self._interleaver.current.swap(requester, self._fn)
 
         return self._source
 

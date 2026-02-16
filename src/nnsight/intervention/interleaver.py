@@ -343,6 +343,9 @@ class Interleaver:
             # Iterate here means this provided can be provided more than once so the provider string will be updated to include the iteration.
             value = self.handle(f"{name}.output", value, iterate=True)
 
+            for mediator in self.mediators:
+                mediator.history.remove(f"{name}.fn")
+
             return value
 
         return inner

@@ -1,9 +1,7 @@
 import warnings
-from typing import Callable, TYPE_CHECKING, Any, Union
+from typing import Callable, Union
 from .base import Tracer
-from ..backends.execution import ExecutionBackend
-from ..interleaver import Interleaver, Mediator
-from .util import try_catch
+from ..interleaver import Interleaver
 
 
 class IteratorProxy:
