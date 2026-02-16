@@ -344,7 +344,8 @@ class Interleaver:
             value = self.handle(f"{name}.output", value, iterate=True)
 
             for mediator in self.mediators:
-                mediator.history.remove(f"{name}.fn")
+                if f"{name}.fn" in mediator.history:
+                    mediator.history.remove(f"{name}.fn")
 
             return value
 
