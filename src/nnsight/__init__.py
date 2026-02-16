@@ -60,7 +60,7 @@ except NameError:
 
 __INTERACTIVE__ = (sys.flags.interactive or not sys.argv[0]) and not __IPYTHON__
 
-NNS_VLLM_VERSION = "0.14.1"
+NNS_VLLM_VERSION = "0.15.1"
 
 
 from .intervention.envoy import Envoy
