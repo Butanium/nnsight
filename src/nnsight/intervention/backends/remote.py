@@ -399,7 +399,7 @@ def pull_env():
         # missing_modules = local_modules - remote_modules
         # for module in missing_modules:
         #     register(module)
-        # _PULLED_ENV = True
+        _PULLED_ENV = True
 
 
 class RemoteException(Exception):
