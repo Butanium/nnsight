@@ -44,22 +44,18 @@ This example uses Docker containers to simulate multiple Ray nodes on a single m
 
 - Docker with NVIDIA Container Toolkit (`nvidia-docker`)
 - 2+ GPUs
-- nnsight installed (or source available to mount)
+- nnsight installed on the host (for running the test script)
 
 ### 1. Configure
 
 Edit `docker-compose.yml`:
 
 - Set `device_ids` for each service to free GPUs on your machine
-- Set `NNSIGHT_SRC` to your nnsight source directory, or update the volume mount paths
-- Set `HF_CACHE` to your HuggingFace cache, or update the volume mount path
+- Optionally set `HF_CACHE` to your HuggingFace cache directory
 
 ```bash
-# Option A: Set environment variables
-export NNSIGHT_SRC=/path/to/nnsight/src/nnsight
+# Optional: point to your HF cache so models aren't re-downloaded in containers
 export HF_CACHE=~/.cache/huggingface
-
-# Option B: Edit docker-compose.yml volume mounts directly
 ```
 
 ### 2. Start the Cluster
@@ -130,7 +126,7 @@ print(model.tokenizer.decode(logits.argmax(dim=-1)))
 
 - `RAY_ADDRESS` must be a **GCS address** (`host:6379`), not a Ray Client address (`ray://host:10001`). vLLM's compiled DAGs require full Ray runtime access.
 - The `tensor_parallel_size` must match the total number of GPUs you want to use across the cluster.
-- nnsight must be importable on all Ray worker nodes (installed or volume-mounted).
+- nnsight must be installed on all Ray worker nodes.
 - Set `NCCL_P2P_DISABLE=1` and `NCCL_SHM_DISABLE=1` on worker nodes if GPUs are in separate containers or machines without NVLink/shared memory.
 
 ### Docker Environment Variables
