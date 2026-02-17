@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Any, Dict, List, Optional, Union
+from typing import Optional, Type
 
 import torch
-from diffusers import pipelines
-from diffusers import DiffusionPipeline
+from diffusers import DiffusionPipeline, pipelines
 from transformers import PreTrainedTokenizerBase
 
 from .. import util
 from .huggingface import HuggingFaceModel
-from typing import Type
 
 
 def _resolve_component_cls(lib_name: str, cls_name: str):
@@ -61,7 +59,8 @@ def _build_pipeline_from_config(
     Downloads only the pipeline's ``model_index.json`` config and each
     component's ``config.json`` (a few KB total).  Each ``nn.Module``
     component is instantiated from its config — no pretrained weights
-    are downloaded.  Non-module components (tokenizers, schedulers,
+    are downloaded.  Tokenizers are loaded normally (they are lightweight
+    and have no model weights).  Other non-module components (schedulers,
     feature extractors) are set to ``None``.
 
     This is called inside ``init_empty_weights()`` by
@@ -90,6 +89,10 @@ def _build_pipeline_from_config(
         if key.startswith("_"):
             continue
 
+        if not isinstance(val, list):
+            kwargs[key] = val
+            continue
+
         lib_name, cls_name = val
 
         # Honour explicit user overrides (e.g. safety_checker=None)
@@ -99,7 +102,20 @@ def _build_pipeline_from_config(
 
         cls = _resolve_component_cls(lib_name, cls_name)
 
-        if cls is None or not (isinstance(cls, type) and issubclass(cls, torch.nn.Module)):
+        if cls is None:
+            components[key] = None
+            continue
+
+        if isinstance(cls, type) and issubclass(cls, PreTrainedTokenizerBase):
+            try:
+                components[key] = cls.from_pretrained(
+                    repo_id, subfolder=key, revision=revision
+                )
+            except Exception:
+                components[key] = None
+            continue
+
+        if not (isinstance(cls, type) and issubclass(cls, torch.nn.Module)):
             components[key] = None
             continue
 
@@ -119,6 +135,17 @@ def _build_pipeline_from_config(
                     components[key] = cls(auto_cfg)
         except Exception:
             components[key] = None
+
+    # Filter out from_pretrained()-specific kwargs that the pipeline
+    # constructor doesn't accept (e.g. torch_dtype, variant, device_map).
+    init_sig = inspect.signature(pipe_cls.__init__)
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in init_sig.parameters.values()
+    )
+    if not has_var_keyword:
+        valid_params = set(init_sig.parameters.keys()) - {"self"}
+        kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
 
     return pipe_cls(**components, **kwargs)
 
@@ -243,8 +270,9 @@ class DiffusionModel(HuggingFaceModel):
         Downloads only the pipeline and component config files (a few KB).
         Each ``nn.Module`` component is instantiated from its config with
         meta-device parameters — no pretrained weights are downloaded.
-        Non-module components (tokenizer, scheduler, etc.) are set to
-        ``None`` and will be loaded on :meth:`dispatch`.
+        Tokenizers are loaded normally (they are lightweight).  Other
+        non-module components (scheduler, etc.) are set to ``None`` and
+        will be loaded on :meth:`dispatch`.
 
         Args:
             repo_id: HuggingFace repository ID.
@@ -275,6 +303,8 @@ class DiffusionModel(HuggingFaceModel):
         Returns:
             A :class:`Diffuser` instance.
         """
+
+        device_map = "balanced" if device_map == "auto" or device_map is None else device_map
 
         model = Diffuser(
             self.automodel, repo_id, revision=revision, device_map=device_map, **kwargs
