@@ -498,6 +498,62 @@ class TestInvokerBatching:
         assert torch.equal(out_3, out_4)
         assert torch.equal(torch.concatenate([out_1, out_2, out_5]), out_3)
 
+    @torch.no_grad()
+    def test_invoke_list_attention_mask(self, gpt2: nnsight.LanguageModel):
+        """Test that attention masks are correct when batching invokes with lists.
+
+        When an invoke passes a list of prompts with different lengths, the
+        shorter prompts get internal padding. When _batch combines this with
+        another invoke, it must preserve the attention masks from both the old
+        batch AND the new invoke. Previously only the old batch's mask was
+        restored, causing padding tokens in the new invoke to be treated as
+        real tokens.
+        """
+        prompts = ["Hi", "A B C", "D"]
+
+        # Method 1: all prompts as a single list (ground truth)
+        with gpt2.trace(prompts):
+            list_logits = gpt2.lm_head.output[:, -1].save()
+
+        # Method 2: single invoke + list invoke
+        with gpt2.trace() as tracer:
+            with tracer.invoke("Hi"):
+                pass
+            with tracer.invoke(["A B C", "D"]):
+                pass
+            with tracer.invoke():
+                invoke_logits = gpt2.lm_head.output[:, -1].save()
+
+        assert torch.allclose(list_logits, invoke_logits, atol=1e-5)
+
+        # Method 3: list invoke + single invoke
+        with gpt2.trace(["A B C", "D", "Hi"]):
+            list_logits2 = gpt2.lm_head.output[:, -1].save()
+
+        with gpt2.trace() as tracer:
+            with tracer.invoke(["A B C", "D"]):
+                pass
+            with tracer.invoke("Hi"):
+                pass
+            with tracer.invoke():
+                invoke_logits2 = gpt2.lm_head.output[:, -1].save()
+
+        assert torch.allclose(list_logits2, invoke_logits2, atol=1e-5)
+
+        # Method 4: list invoke + list invoke
+        with gpt2.trace(["Hi", "A B C", "The quick brown fox", "D"]):
+            list_logits3 = gpt2.lm_head.output[:, -1].save()
+
+        with gpt2.trace() as tracer:
+            with tracer.invoke(["Hi", "A B C"]):
+                pass
+            with tracer.invoke(["The quick brown fox", "D"]):
+                pass
+            with tracer.invoke():
+                invoke_logits3 = gpt2.lm_head.output[:, -1].save()
+
+        assert torch.allclose(list_logits3, invoke_logits3, atol=1e-5)
+
 
 # =============================================================================
 # Scanning and Validation

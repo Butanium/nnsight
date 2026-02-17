@@ -344,19 +344,20 @@ class LanguageModel(TransformersModel):
 
             batched_labels = torch.cat((batched_labels, labels))
 
-        if attention_mask is not None:
+        new_attention_mask = prepared_kwargs.get("attention_mask", None)
+        n_old = attention_mask.shape[0] if attention_mask is not None else 0
+        left = self.tokenizer.padding_side == "left"
 
-            if self.tokenizer.padding_side == "left":
+        combined_mask = torch.zeros_like(new_batched_inputs["attention_mask"])
 
-                new_batched_inputs["attention_mask"][
-                    : attention_mask.shape[0], -attention_mask.shape[1] :
-                ] = attention_mask
+        for row_start, mask in [(0, attention_mask), (n_old, new_attention_mask)]:
+            if mask is not None:
+                if left:
+                    combined_mask[row_start : row_start + mask.shape[0], -mask.shape[1] :] = mask
+                else:
+                    combined_mask[row_start : row_start + mask.shape[0], : mask.shape[1]] = mask
 
-            else:
-
-                new_batched_inputs["attention_mask"][
-                    : attention_mask.shape[0], : attention_mask.shape[1]
-                ] = attention_mask
+        new_batched_inputs["attention_mask"] = combined_mask
 
         batched_inputs.pop("input_ids", None)
         batched_inputs.pop("attention_mask", None)
