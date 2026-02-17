@@ -142,7 +142,7 @@ class VLLM(RemoteableMixin):
         destroy_distributed_environment()
 
         if kwargs.get("distributed_executor_backend") == "ray":
-            from .ray_workaround import NNsightRayExecutor
+            from .executors.ray_workaround import NNsightRayExecutor
             kwargs["distributed_executor_backend"] = NNsightRayExecutor
 
         llm = LLM(

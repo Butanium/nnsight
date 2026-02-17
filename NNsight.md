@@ -2448,34 +2448,32 @@ vLLM integration provides high-performance inference with NNsight interventions.
 │  User Code                                              │
 │  with model.trace("Hello") as tracer:                   │
 │      logits = model.logits.output.save()                │
-└──────┬─────────────────────────────────────────────────┘
-       |                
-       ▼
+└──────┬──────────────────────────────────────────────────┘
+       |
+       v
 ┌─────────────────────────────────────────────────────────┐
-│  VLLM Class                                             |
-|  - Instantiates empty 'meta' model                      │
-│  - Creates NNsightSamplingParams with serialized        │
-│    Mediator attached                                    │
+│  VLLM Class                                             │
+│  - Instantiates empty 'meta' model for envoy tree       │
+│  - Serializes mediator into extra_args on SamplingParams │
+│  - If Ray: swaps "ray" for NNsightRayExecutor class     │
 │  - Sends prompts + params to vLLM engine                │
 └───────┬───────────────────────────────────────▲─────────┘
-        │                                       |
-        |                                       |
-┌───────▼──────────────────────────────────────────────────────────────────┐
-│  NNsightLLMEngine                                                        |
-|       |            - Sends final result back to NNsightGPUModelRunner    |
-|       |              for interleaving and gathering saved values         |
-└───────|──────────────────────────────────────────────▲───────────────────┘
-        │                                              |
-        |                                              |
-┌───────▼──────────────────────────────────────────────▼──────────────────────────────────────────────────────┐
-|  NNsightGPUModelRunner - Pre-wrapped NNsight model                                                          │
-│  - Deserializes Mediator from SamplingParams          finish_nnsight()                                      │
-│  - Manages batch groups (flat ↔ unflatten)            4.) Lets intervention code interact with final output │
-│  - Runs interleaving at multiple phases               - Collects saved values                               |
-|    1.) Forward Pass                                   - Handles continuous batching cleanup                 |
-|    2.) Logits                                                                                               |
-|    3.) Sampling                                                                                             |
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        │                                       │
+┌───────v───────────────────────────────────────┼──────────────────────┐
+│  NNsightLLMEngine                             │                      │
+│       │            - Detects finished requests │                      │
+│       │            - Calls finish_nnsight() to collect saved values   │
+└───────┼───────────────────────────────────────▲──────────────────────┘
+        │                                       │
+┌───────v───────────────────────────────────────┴──────────────────────────────────────────┐
+│  NNsightGPUModelRunner - Pre-wrapped NNsight model                                       │
+│  - Deserializes mediator from extra_args          finish_nnsight()                       │
+│  - Manages batch groups (flat <-> unflatten)      4.) Handles "result" provider          │
+│  - Runs interleaving at multiple phases           - Collects saved values from frames    │
+│    1.) Forward Pass                               - Returns pickled bytes                │
+│    2.) Logits                                                                            │
+│    3.) Sampling                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### Usage
@@ -2496,25 +2494,33 @@ with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
 print(output)
 ```
 
+For multi-GPU with Ray:
+
+```python
+model = VLLM("gpt2", tensor_parallel_size=2, distributed_executor_backend="ray", dispatch=True)
+```
+
 ---
 
 #### Model Loading
 
-vLLM loads models through its own infrastructure. NNsight wraps the loaded model:
+vLLM loads models through its own infrastructure. NNsight wraps the loaded model.
+
+**User-side (`_load`):** Creates a `vllm.LLM` with `worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker"`. If `distributed_executor_backend="ray"`, the string is replaced with `NNsightRayExecutor` (a custom executor class). After creation, the engine class is patched to `NNsightLLMEngine`.
+
+**Worker-side (`NNsightGPUModelRunner.load_model`):**
 
 ```python
 class NNsightGPUModelRunner(GPUModelRunner):
     def load_model(self, *args, **kwargs):
         # vLLM loads the model normally
         super().load_model(*args, **kwargs)
-        
+
         # Wrap in NNsight
         self.nnsight_model = VLLM(self.model)
-        
-        # Use vLLM-specific batcher
+
+        # Use vLLM-specific batcher with tensor parallelism hooks
         self.nnsight_model._interleaver.batcher = VLLMBatcher()
-        
-        # Add tensor parallelism hooks
         self.nnsight_model._interleaver.batcher.wrap(self.nnsight_model)
 ```
 
@@ -2522,40 +2528,42 @@ The `VLLMBatcher.wrap()` adds hooks to all modules specifically for handling ten
 
 ---
 
-#### Mediator Transport via SamplingParams
+#### Mediator Transport via extra_args
 
 The challenge: Mediators (intervention code) are created in user code but must execute inside vLLM's model runner, potentially on different processes.
 
-**Solution:** Attach mediators to vLLM's `SamplingParams`:
+**Solution:** Serialize mediators into the built-in `SamplingParams.extra_args` dict:
 
 ```python
-class NNsightSamplingParams(SamplingParams):
-    mediator: Optional[Mediator | bytes] = None
-    
-    def __reduce__(self):
-        state = structs.asdict(self)
-        
-        # Serialize mediator for transport
-        if isinstance(self.mediator, Mediator):
-            state["mediator"] = save(self.mediator)
-        
-        return (rebuild, (state,))
+# In VLLM.__call__() — user process
+param.extra_args = {"nnsight_mediator": serialize(mediator)}
+
+# Subsequent prompts in the same invoke:
+param.extra_args = {"nnsight_batch_member": True}
 ```
 
 When a trace is created:
 1. Intervention code is compiled into a Mediator
-2. Mediator is serialized to bytes
-3. Bytes are attached to `NNsightSamplingParams`
-4. vLLM passes SamplingParams through its pipeline
+2. Mediator is serialized to bytes via `serialize()` and stored in `extra_args["nnsight_mediator"]`
+3. Subsequent prompts in the same invoke get `extra_args["nnsight_batch_member"] = True`
+4. vLLM passes SamplingParams (with `extra_args`) through its pipeline — survives both msgpack (multiprocessing) and pickle (Ray)
 5. Model runner deserializes and executes the Mediator
 
 ```python
-# In model runner
-if isinstance(new_req.sampling_params.mediator, bytes):
-    new_req.sampling_params.mediator = load(
-        new_req.sampling_params.mediator, model
-    )
+# In NNsightRequestHelper.process_new_reqs() — worker process
+extra_args = getattr(new_req.sampling_params, 'extra_args', None)
+mediator_bytes = extra_args.get("nnsight_mediator") if extra_args else None
+
+if mediator_bytes is not None:
+    self.last_mediator = load(mediator_bytes, model._remoteable_persistent_objects())
+    model._interleaver.mediators.append(self.last_mediator)
+
+elif extra_args and extra_args.get("nnsight_batch_member"):
+    # Associate with the most recently deserialized mediator
+    self.num_prompts_in_mediator[self.last_mediator] += 1
 ```
+
+`NNsightSamplingParams` is a thin subclass used only for type identification — no custom `__reduce__()` or mediator field needed.
 
 ---
 
@@ -2567,27 +2575,29 @@ vLLM uses a **flat tensor format** for efficiency. Standard NNsight uses `[batch
 
 ```
 Standard NNsight:
-  Prompt 1: [1, 5, 768]  →  batch_group = [0, 1]
-  Prompt 2: [1, 3, 768]  →  batch_group = [1, 1]
+  Prompt 1: [1, 5, 768]  ->  batch_group = [0, 1]
+  Prompt 2: [1, 3, 768]  ->  batch_group = [1, 1]
 
 vLLM (flat):
-  All tokens: [8, 768]   →  batch_group = [0, 5] for prompt 1
-                             batch_group = [5, 3] for prompt 2
+  All tokens: [8, 768]   ->  batch_group = [0, 5] for prompt 1
+                              batch_group = [5, 3] for prompt 2
 ```
 
-**Solution:** Track batch groups differently during forward pass vs. after sampling:
+**Solution:** Track batch groups differently during forward pass vs. after:
 
 ```python
 class NNsightRequestHelper:
-    def process_new_reqs(self, new_reqs, model):
-        for new_req in new_reqs:
-            mediator = new_req.sampling_params.mediator
-            batch_size = len(new_req.prompt_token_ids)  # Token count
-            
+    def process_batch_groups(self, num_tokens_scheduled, requests, model):
+        batch_start = 0
+        for req_id, num_tokens in num_tokens_scheduled.items():
+            mediator = self.mediators.get(req_id)
+            if mediator is None:
+                batch_start += num_tokens
+                continue
             # Batch group is [start_token, num_tokens] during forward
-            batch_start = sum(model._interleaver.batcher.last_batch_group)
-            mediator.batch_group = [batch_start, batch_size]
-    
+            mediator.batch_group = [batch_start, num_tokens]
+            batch_start += num_tokens
+
     def unflatten(self, model):
         # After forward, switch to [start_prompt, num_prompts]
         batch_start = 0
@@ -2599,7 +2609,7 @@ class NNsightRequestHelper:
 
 This allows:
 - During forward pass: interventions work on token-level tensors
-- After sampling: interventions work on prompt-level outputs
+- After forward: interventions work on prompt-level outputs (logits, samples)
 
 ---
 
@@ -2609,32 +2619,30 @@ vLLM separates execution into distinct phases. NNsight interleaves at each:
 
 ```python
 def execute_model(self, scheduler_output, intermediate_tensors=None):
-    # Phase 1: Model forward pass
+    Globals.enter()
     with self.nnsight_model._interleaver:
-        super().execute_model(scheduler_output, intermediate_tensors)
-        
+        # Phase 1: Model forward pass
+        return_value = super().execute_model(scheduler_output, intermediate_tensors)
+
         # Switch batch groups from tokens to prompts
         self.nnsight_request_helper.unflatten(self.nnsight_model)
-        
+
         # Phase 2: Logits (hooked separately)
-        logits = self.model.logits(self.execute_model_state.logits, hook=True)
+        if self.execute_model_state is not None:
+            logits = self.nnsight_model.logits(
+                self.execute_model_state.logits, hook=True
+            )
+    Globals.exit()
 
 def _sample(self, *args, **kwargs):
-    # Phase 3: Sampling
+    Globals.enter()
     with self.nnsight_model._interleaver:
+        # Phase 3: Sampling
         sampler_output = super()._sample(*args, **kwargs)
-        
-        # Hook sampled tokens
         sampler_output.sampled_token_ids = self.model.samples(
             sampler_output.sampled_token_ids, hook=True
         )
-
-def finish_nnsight(self, finished_requests):
-    # Phase 4: Final output
-    with self.nnsight_model._interleaver:
-        finished_requests[0] = self.nnsight_model._interleaver.handle(
-            "result", finished_requests[0]
-        )
+    Globals.exit()
 ```
 
 **Wrapper Modules:**
@@ -2671,39 +2679,39 @@ vLLM uses two types of parallel linear layers:
 | `ColumnParallelLinear` | Output sharded across GPUs | Each GPU has `1/N` of output columns |
 | `RowParallelLinear` | Input sharded, output reduced | Each GPU processes `1/N` of input |
 
-**The Solution: Gather → Intervene → Reshard**
+**The Solution: Gather -> Intervene -> Reshard**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  GPU 0                          GPU 1                               │
 │  ┌─────────┐                    ┌─────────┐                         │
-│  │ Shard 0 │                    │ Shard 1 │   ← Sharded tensor      │
+│  │ Shard 0 │                    │ Shard 1 │   <- Sharded tensor     │
 │  └────┬────┘                    └────┬────┘                         │
 │       │                              │                              │
-│       ▼                              ▼                              │
+│       v                              v                              │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │              all_gather() - collect all shards              │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │       │                              │                              │
-│       ▼                              ▼                              │
+│       v                              v                              │
 │  ┌───────────────┐              ┌───────────────┐                   │
-│  │ Full Tensor   │              │ Full Tensor   │   ← Complete      │
+│  │ Full Tensor   │              │ Full Tensor   │   <- Complete     │
 │  │ [all shards]  │              │ [all shards]  │     (identical)   │
 │  └───────┬───────┘              └───────┬───────┘                   │
 │          │                              │                           │
-│          ▼                              ▼                           │
+│          v                              v                           │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │           Intervention code runs (identical on all GPUs)    │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │          │                              │                           │
-│          ▼                              ▼                           │
+│          v                              v                           │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │              split() - re-shard for forward pass            │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │          │                              │                           │
-│          ▼                              ▼                           │
+│          v                              v                           │
 │  ┌─────────┐                    ┌─────────┐                         │
-│  │ Shard 0 │                    │ Shard 1 │   ← Sharded again       │
+│  │ Shard 0 │                    │ Shard 1 │   <- Sharded again      │
 │  └─────────┘                    └─────────┘                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -2718,14 +2726,14 @@ class VLLMBatcher(Batcher):
         def pre_input_hook(module, args, kwargs):
             self.current_module = module
             self.type = "input"
-            
+
             if isinstance(module, RowParallelLinear):
                 self.parallel = module.input_is_parallel
-        
+
         def pre_output_hook(module, args, output):
             self.current_module = module
             self.type = "output"
-            
+
             if isinstance(module, ColumnParallelLinear):
                 self.parallel = not module.gather_output
 ```
@@ -2741,7 +2749,7 @@ def check_gathered(self):
                 self.current_value = tensor_model_parallel_all_gather(
                     self.current_value
                 )
-        
+
         elif isinstance(self.current_module, RowParallelLinear):
             if self.type == "input":
                 # Gather sharded input
@@ -2753,7 +2761,7 @@ def check_gathered(self):
                 self.current_value = tensor_model_parallel_all_reduce(
                     self.current_value
                 )
-        
+
         self.gathered = True
 ```
 
@@ -2767,11 +2775,11 @@ def post_output_hook(module, args, output):
             output = split_tensor_along_last_dim(
                 output, num_partitions=module.tp_size
             )[module.tp_rank].contiguous()
-        
+
         elif isinstance(self.current_module, RowParallelLinear):
             # Undo all_reduce by dividing
             output = output / module.tp_size
-    
+
     return output
 ```
 
@@ -2781,58 +2789,111 @@ def post_output_hook(module, args, output):
 
 #### Continuous Batching Support
 
-vLLM uses continuous batching: new requests join and finished requests leave mid-execution. NNsight handles this by continuously updating batch groups:
+vLLM uses continuous batching: new requests join and finished requests leave mid-execution. NNsight handles this through `NNsightRequestHelper`, which maintains a `mediators` dict keyed by request ID (independent of vLLM's internal request tracking):
 
 ```python
-def process_finished_reqs(self, finished_request_ids, requests, model):
-    batch_start = 0
-    seen_mediators = set()
-    
-    for req_id, req in requests.items():
-        if req_id in finished_request_ids:
-            continue  # Skip finished
-        
-        mediator = req.sampling_params.mediator
-        
-        if mediator in seen_mediators:
-            mediator.batch_group[1] += 1  # Increment size
-        else:
-            seen_mediators.add(mediator)
-            mediator.batch_group = [batch_start, 1]  # New group
-        
-        batch_start += 1
+class NNsightRequestHelper:
+    def __init__(self):
+        self.mediators: Dict[str, Any] = {}  # req_id -> Mediator
+        self.last_mediator = None             # persists across calls
+
+    def process_batch_groups(self, num_tokens_scheduled, requests, model):
+        batch_start = 0
+        seen_mediators = set()
+        for req_id, num_tokens in num_tokens_scheduled.items():
+            mediator = self.mediators.get(req_id)
+            if mediator is None:
+                batch_start += num_tokens
+                continue
+            if mediator in seen_mediators:
+                mediator.batch_group[1] += num_tokens
+            else:
+                seen_mediators.add(mediator)
+                mediator.batch_group = [batch_start, num_tokens]
+            batch_start += num_tokens
 ```
 
-When requests finish, `finish_nnsight()`:
-1. Runs final interleaving for the "result" phase
-2. Collects saved values from mediator frames
-3. Cancels the mediator
-4. Updates batch groups for remaining requests
+When requests finish, `finish_nnsight()` receives a list of finished request IDs from the engine:
+1. Matches request IDs to stored mediators
+2. Runs final interleaving for the "result" provider
+3. Collects saved values from mediator frames
+4. Returns pickled bytes (survives msgpack transport in multiprocessing mode)
+5. Cleans up mediator entries
 
 ```python
-def finish_nnsight(self, finished_requests):
-    # Let interventions interact with final output
-    with self.nnsight_model._interleaver:
-        finished_requests[0] = self.nnsight_model._interleaver.handle(
-            "result", finished_requests[0]
-        )
-    
-    # Collect saved values
-    result = {}
-    for req in finished_requests:
-        mediator = req.sampling_params.mediator
-        frame = mediator.info.frame
-        
-        for key, value in frame.items():
+def finish_nnsight(self, finished_req_ids: list[str]) -> Optional[bytes]:
+    # Match finished engine-level req_ids to stored mediators
+    for req_id, mediator in self.nnsight_request_helper.mediators.items():
+        internal_id = req_id.split("-")[0]
+        if internal_id in finished_req_id_set:
+            matched.append((internal_id, mediator))
+
+    # Run "result" phase and collect saves
+    for internal_id, mediator in matched:
+        with self.nnsight_model._interleaver:
+            self.nnsight_model._interleaver.handle("result", outputs)
+            mediator.cancel()
+
+    # Extract saved values from mediator frames
+    for _, mediator in matched:
+        for key, value in mediator.info.frame.f_locals.items():
             if id(value) in Globals.saves:
-                result[key] = value
-    
-    # Cleanup
-    for req_id in finished_request_ids:
-        req.sampling_params.mediator.cancel()
-    
-    return result
+                saves[key] = value
+
+    return pickle.dumps(saves)
 ```
+
+---
+
+#### Ray Distributed Executor
+
+vLLM supports a `"ray"` executor backend that uses Ray actors instead of multiprocessing for tensor-parallel workers. This enables multi-node inference where TP workers run on different machines.
+
+**The Problem:** vLLM v0.15.1 + Ray 2.53.0 have a compatibility issue where Ray actor processes crash during construction. When Ray creates a `RayWorkerWrapper` actor, it imports `vllm.v1.executor.ray_utils`, which transitively imports heavy vLLM submodules (`vllm.multimodal`, etc.) at module level. These imports conflict with Ray's internal gRPC event engine (grpcio's `cygrpc` C extension) during actor construction, causing a segfault with no Python traceback. The same imports work fine during actor **method execution** (after construction).
+
+**The Fix:** `NNsightRayExecutor` subclasses `RayDistributedExecutor` and swaps in `LazyRayWorkerWrapper` (which defers heavy imports to `__init__` time) before creating workers. It also handles three Ray initialization scenarios — connecting to a local Ray, joining a remote cluster via `RAY_ADDRESS`, or starting a fresh cluster:
+
+```python
+class NNsightRayExecutor(RayDistributedExecutor):
+    def _init_executor(self) -> None:
+        import os, ray, subprocess
+        import vllm.v1.executor.ray_utils as ray_utils
+        import vllm.v1.executor.ray_executor as ray_exec
+        ray_utils.RayWorkerWrapper = LazyRayWorkerWrapper
+        ray_exec.RayWorkerWrapper = LazyRayWorkerWrapper
+        self.forward_dag = None
+
+        if not ray.is_initialized():
+            ray_address = os.environ.get("RAY_ADDRESS")
+            try:
+                ray.init(address="auto")           # local Ray already running
+            except (ConnectionError, ValueError, RuntimeError):
+                if ray_address:
+                    subprocess.run(                 # join remote cluster as driver-only node
+                        ["ray", "start", f"--address={ray_address}",
+                         "--num-gpus=0", "--num-cpus=0"],
+                        check=True, capture_output=True,
+                    )
+                    ray.init(address="auto")
+                else:
+                    ray.init()                      # start fresh local cluster
+
+        # ... placement group creation, VLLM_HOST_IP fix, _init_workers_ray ...
+```
+
+In `VLLM._load()`, the string `"ray"` is replaced with this class:
+
+```python
+if kwargs.get("distributed_executor_backend") == "ray":
+    from .executors.ray_workaround import NNsightRayExecutor
+    kwargs["distributed_executor_backend"] = NNsightRayExecutor
+```
+
+vLLM's `EngineArgs.distributed_executor_backend` accepts `type[Executor]`, so passing a class directly is supported. This works with multiprocessing mode because vLLM pickles the executor class to the EngineCore subprocess, where `_init_executor()` runs and swaps in the lazy wrapper before any Ray actors are created. No env var overrides needed.
+
+The rest of the NNsight integration (`worker_cls`, `collective_rpc`, `execute_model`, mediator transport via `extra_args`) works identically across Ray and multiprocessing backends.
+
+**Multi-node support:** For multi-node tensor parallelism (TP workers on different machines), set `RAY_ADDRESS` to an existing Ray cluster's GCS address (`host:6379`, **not** `ray://host:port`). The executor joins the cluster as a driver-only node and places workers across available nodes. See [`src/nnsight/modeling/vllm/README.md`](src/nnsight/modeling/vllm/README.md) for full architectural details, and [`src/nnsight/modeling/vllm/examples/multi_node_with_ray/`](src/nnsight/modeling/vllm/examples/multi_node_with_ray/) for a Docker-based multi-node example.
 
 ---
 
