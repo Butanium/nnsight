@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple, Union
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.inputs import TokensPrompt
 
-from vllm import LLM, envs
+from vllm import LLM
 from vllm.distributed import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -34,6 +34,7 @@ from ...intervention.tracing.util import push_variables
 from ...util import WrapperModule
 from ..mixins import RemoteableMixin
 from .sampling import NNsightSamplingParams
+from ...intervention.serialization import save as serialize
 from ... import save
 from .engines.engine import NNsightLLMEngine
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
@@ -42,9 +43,6 @@ if TYPE_CHECKING:
     from torch.nn import Module
 
     from vllm.transformers_utils.tokenizer import AnyTokenizer
-
-
-envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
 
 
 class VLLM(RemoteableMixin):
@@ -142,6 +140,10 @@ class VLLM(RemoteableMixin):
 
         destroy_model_parallel()
         destroy_distributed_environment()
+
+        if kwargs.get("distributed_executor_backend") == "ray":
+            from .ray_workaround import NNsightRayExecutor
+            kwargs["distributed_executor_backend"] = NNsightRayExecutor
 
         llm = LLM(
             repo_id,
@@ -284,7 +286,14 @@ class VLLM(RemoteableMixin):
                 # If its the first prompt in the batch group, it will transfer the mediator to the workers
                 if i == 0:
 
-                    param.mediator = mediator
+                    mediator.intervention.__source__ = "".join(mediator.info.source)
+                    param.extra_args = {"nnsight_mediator": serialize(mediator)}
+
+                else:
+                    # Mark subsequent prompts as batch members so the worker
+                    # can associate them with the same mediator, even if the
+                    # scheduler splits them across steps.
+                    param.extra_args = {"nnsight_batch_member": True}
 
                 param_idx += 1
 
@@ -296,7 +305,6 @@ class VLLM(RemoteableMixin):
                         setattr(param, attr, value)
 
         # Do VLLM generation with NNsight
-        print("prompts", prompts)
         outputs = self.vllm_entrypoint.generate(prompts, sampling_params=params)
 
         saves = {}
@@ -326,3 +334,22 @@ class VLLM(RemoteableMixin):
         finally:
             self._interleaver.check_cache_full()
             self._interleaver.cancel()
+
+    def _remoteable_persistent_objects(self) -> dict:
+        persistent_objects = super()._remoteable_persistent_objects()
+        persistent_objects["Tokenizer"] = self.tokenizer
+        return persistent_objects
+
+    def __getstate__(self):
+
+        state = super().__getstate__()
+        state["vllm_entrypoint"] = None
+        if self.tokenizer is not None:
+            self.tokenizer._persistent_id = "Tokenizer"
+        state["tokenizer"] = self.tokenizer
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.vllm_entrypoint = state["vllm_entrypoint"]
+        self.tokenizer = state["tokenizer"]

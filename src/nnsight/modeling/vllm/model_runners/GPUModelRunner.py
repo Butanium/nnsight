@@ -1,10 +1,9 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+import pickle
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.outputs import RequestOutput
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
-from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from nnsight.intervention.tracing.globals import Globals
@@ -50,6 +49,8 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
             self.req_id_to_batch_group_idx: Dict[str, int] = {}
             self.num_prompts_in_mediator = {}
+            self.mediators: Dict[str, Any] = {}  # req_id -> Mediator
+            self.last_mediator = None  # persists across process_new_reqs calls
 
         def process_new_reqs(
             self, new_reqs: List["NewRequestData"], model: VLLM
@@ -73,35 +74,36 @@ class NNsightGPUModelRunner(GPUModelRunner):
                 - Advances to next batch group when current group capacity is exceeded
             """
 
-            last_mediator = None
-
             for new_req in new_reqs:
 
-                if isinstance(new_req.sampling_params.mediator, bytes):
+                extra_args = getattr(new_req.sampling_params, 'extra_args', None)
+                mediator_bytes = extra_args.get("nnsight_mediator") if extra_args else None
 
-                    new_req.sampling_params.mediator = load(
-                        new_req.sampling_params.mediator,
+                # If its the first prompt / request within an invoke
+                if mediator_bytes is not None:
+
+                    self.last_mediator = load(
+                        mediator_bytes,
                         model._remoteable_persistent_objects(),
                     )
 
-                mediator = new_req.sampling_params.mediator
+                    model._interleaver.mediators.append(self.last_mediator)
 
-                # If its the first prompt / request within an invoke
-                if mediator is not None:
+                    self.last_mediator.start(model._interleaver)
 
-                    last_mediator = mediator
+                    self.num_prompts_in_mediator[self.last_mediator] = 1
 
-                    model._interleaver.mediators.append(mediator)
+                elif extra_args and extra_args.get("nnsight_batch_member"):
 
-                    mediator.start(model._interleaver)
-
-                    self.num_prompts_in_mediator[mediator] = 1
+                    if self.last_mediator not in self.num_prompts_in_mediator:
+                        self.num_prompts_in_mediator[self.last_mediator] = 0
+                    self.num_prompts_in_mediator[self.last_mediator] += 1
 
                 else:
+                    # Non-NNsight request, skip
+                    continue
 
-                    new_req.sampling_params.mediator = last_mediator
-
-                    self.num_prompts_in_mediator[last_mediator] += 1
+                self.mediators[new_req.req_id] = self.last_mediator
 
         def unflatten(self, model: VLLM):
 
@@ -128,7 +130,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         def process_batch_groups(
             self,
             num_tokens_scheduled: Dict[str, int],
-            requests: Dict[str, "RequestData"],
+            requests,
             model: VLLM,
         ) -> None:
 
@@ -140,9 +142,11 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
             for req_id, num_tokens in num_tokens_scheduled.items():
 
-                request = requests[req_id]
+                mediator = self.mediators.get(req_id)
 
-                mediator = request.sampling_params.mediator
+                if mediator is None:
+                    batch_start += num_tokens
+                    continue
 
                 if mediator in seen_mediators:
 
@@ -251,41 +255,37 @@ class NNsightGPUModelRunner(GPUModelRunner):
         return sampler_output
 
     def finish_nnsight(
-        self, finished_requests: list[RequestOutput]
-    ) -> ModelRunnerOutput:
+        self, finished_req_ids: list[str]
+    ) -> Optional[bytes]:
         result = None
-        # TODO this might not be the output rank?
 
-        finished_requests_by_id = {}
-        for request in finished_requests:
-            finished_requests_by_id[request.request_id] = request
+        finished_req_id_set = set(finished_req_ids)
 
         if get_pp_group().rank == 0:
 
-            requests = []
+            # Match finished engine-level req_ids to our stored mediators.
+            # Use the mediators dict (keyed by internal req_id like "0-abc123")
+            # since self.requests may already be cleaned up in multiprocessing mode.
+            matched = []
+            matched_keys = []
 
-            for request in self.requests.values():
-                internal_id = request.req_id.split("-")[0]
-                if internal_id in finished_requests_by_id:
-                    requests.append(
-                        (internal_id, request, finished_requests_by_id[internal_id])
-                    )
+            for req_id, mediator in self.nnsight_request_helper.mediators.items():
+                internal_id = req_id.split("-")[0]
+                if internal_id in finished_req_id_set:
+                    matched.append((internal_id, mediator))
+                    matched_keys.append(req_id)
 
             outputs = []
 
             Globals.enter()
 
-            for i, (internal_id, request, finished_request) in enumerate(requests):
+            for i, (internal_id, mediator) in enumerate(matched):
 
-                outputs.append(finished_request)
+                outputs.append(internal_id)
 
-                if (
-                    i == len(requests) - 1
-                    or requests[i + 1][1].sampling_params.mediator
-                    != request.sampling_params.mediator
-                ):
+                next_mediator = matched[i + 1][1] if i < len(matched) - 1 else None
 
-                    mediator = request.sampling_params.mediator
+                if next_mediator != mediator:
 
                     if mediator.alive:
 
@@ -303,23 +303,27 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
             Globals.exit()
 
-            result = {}
+            saves = {}
 
             removals = set()
 
-            # TODO saves need to be removed on all processes
-            for _, request, _ in requests:
-                if request.sampling_params.mediator is None:
-                    continue
-                frame = request.sampling_params.mediator.info.frame
+            for _, mediator in matched:
+                frame = mediator.info.frame
 
                 for key, value in frame.f_locals.items():
 
                     if id(value) in Globals.saves:
-                        result[key] = value
+                        saves[key] = value
                         removals.add(id(value))
 
             for _id in removals:
                 Globals.saves.remove(_id)
+
+            # Pickle so it survives msgpack transport in multiprocessing mode
+            result = pickle.dumps(saves)
+
+            # Clean up mediator entries for finished requests
+            for req_id in matched_keys:
+                self.nnsight_request_helper.mediators.pop(req_id, None)
 
         return result

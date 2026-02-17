@@ -11,12 +11,13 @@ This document details the design and implementation of NNsight's vLLM integratio
 3. [Key Classes](#key-classes)
 4. [Execution Flow](#execution-flow)
 5. [Model Loading](#model-loading)
-6. [Mediator Transport via SamplingParams](#mediator-transport-via-samplingparams)
+6. [Mediator Transport via extra_args](#mediator-transport-via-extra_args)
 7. [Batch Group Management](#batch-group-management)
 8. [Multiple Interleaving Phases](#multiple-interleaving-phases)
 9. [Tensor Parallelism](#tensor-parallelism)
 10. [Continuous Batching](#continuous-batching)
 11. [Multi-Token Generation](#multi-token-generation)
+12. [Ray Distributed Executor](#ray-distributed-executor)
 
 ---
 
@@ -40,8 +41,9 @@ The integration solves each of these by subclassing vLLM's engine, worker, and m
 vllm/
 ├── __init__.py                    # Exports VLLM class
 ├── vllm.py                        # VLLM model wrapper (user-facing class)
-├── sampling.py                    # NNsightSamplingParams — carries serialized mediators
+├── sampling.py                    # NNsightSamplingParams — thin SamplingParams subclass
 ├── batching.py                    # VLLMBatcher — tensor-parallel gather/split + flat-batch slicing
+├── ray_workaround.py              # LazyRayWorkerWrapper + NNsightRayExecutor for Ray support
 ├── engines/
 │   ├── __init__.py
 │   └── engine.py                  # NNsightLLMEngine — collects saved results after requests finish
@@ -56,13 +58,14 @@ vllm/
 ### File Responsibilities
 
 **`vllm.py`** — The `VLLM` class that users instantiate. Handles:
-- Meta/real model loading via mixin inheritance (`RemoteableMixin → MetaMixin → LoadableMixin → NNsight`)
+- Meta/real model loading via mixin inheritance (`RemoteableMixin -> MetaMixin -> LoadableMixin -> NNsight`)
 - Input preparation (`_prepare_input`) — normalizes strings, token ID lists, and HuggingFace tokenizer dicts
 - Batching multiple invokes together (`_batch`)
 - Forwarding calls to the vLLM engine (`__call__`)
 - Creating wrapper modules for `logits`, `samples`, and `generator`
+- Automatic Ray executor substitution when `distributed_executor_backend="ray"`
 
-**`sampling.py`** — `NNsightSamplingParams` extends vLLM's `SamplingParams` with a `mediator` field. Implements `__reduce__()` so mediators survive pickling across process boundaries.
+**`sampling.py`** — `NNsightSamplingParams` is a thin subclass of vLLM's `SamplingParams` used for type identification in `_prepare_input`. Mediator data is transported via the built-in `extra_args` dict field on `SamplingParams`, not on a custom field.
 
 **`batching.py`** — `VLLMBatcher` extends NNsight's base `Batcher` to handle tensor parallelism. Registers pre/post hooks on all modules to track which module is currently executing and whether its tensors are sharded. When intervention code requests a value, the batcher transparently gathers sharded tensors; when intervention code returns a modified value, the batcher re-shards before passing back to vLLM.
 
@@ -72,10 +75,12 @@ vllm/
 
 **`model_runners/GPUModelRunner.py`** — `NNsightGPUModelRunner` is the core of the integration. It:
 - Creates a second `VLLM` wrapper around the model loaded by vLLM (inside the worker process)
-- Deserializes mediators from incoming requests
+- Deserializes mediators from incoming requests via `extra_args`
 - Manages batch group mappings (flat token-level during forward, prompt-level after)
 - Enters the interleaver at three phases: forward pass, logit wrapping, and sampling
 - Collects saved values when requests finish
+
+**`ray_workaround.py`** — Contains `LazyRayWorkerWrapper` and `NNsightRayExecutor` for Ray distributed executor support. See [Ray Distributed Executor](#ray-distributed-executor) for details.
 
 ---
 
@@ -97,7 +102,7 @@ Key attributes:
 
 ### NNsightSamplingParams (sampling.py)
 
-Extends `vllm.SamplingParams` with a `mediator` field. The mediator is serialized to bytes via `save()` for transport and deserialized via `load()` in the worker. Implements `clone()` to deep-copy while preserving mediator references (important because vLLM clones params internally).
+Thin subclass of `vllm.SamplingParams`. The mediator is not stored as a field on this class — instead, serialized mediator bytes are placed in the built-in `SamplingParams.extra_args` dict, which survives vLLM's internal msgpack serialization in multiprocessing mode.
 
 ### VLLMBatcher (batching.py)
 
@@ -110,7 +115,7 @@ Extends NNsight's `Batcher`. Handles two concerns:
 ### NNsightGPUModelRunner (model_runners/GPUModelRunner.py)
 
 The most complex class. Contains an inner `NNsightRequestHelper` that manages:
-- Deserializing mediators from new requests
+- Deserializing mediators from new requests' `extra_args`
 - Mapping request IDs to batch groups (token-level start position and count)
 - Switching batch groups from flat (token-level) to unflattened (prompt-level) after the forward pass
 
@@ -129,6 +134,10 @@ Thin extension of vLLM's engine. After each `step()`, checks for finished reques
 
 Thin extension of vLLM's worker. Monkey-patches the model runner class before init, and exposes `finish_nnsight()` which delegates to the model runner.
 
+### NNsightRayExecutor (ray_workaround.py)
+
+Custom `RayDistributedExecutor` subclass passed as `distributed_executor_backend` when Ray is requested. Swaps in `LazyRayWorkerWrapper` before creating Ray actors. See [Ray Distributed Executor](#ray-distributed-executor).
+
 ---
 
 ## Execution Flow
@@ -146,8 +155,8 @@ NNsight captures, parses, and compiles the intervention code into a `Mediator`.
 **2. `VLLM.__call__()` is invoked:**
 - `_prepare_input()` normalizes the input (tokenizes strings, etc.)
 - `_batch()` combines inputs from all invokes
-- Each invoke's mediator is attached to an `NNsightSamplingParams` instance
-- The mediator is serialized to bytes inside the params
+- Each invoke's mediator is serialized to bytes via `serialize()` and stored in `param.extra_args["nnsight_mediator"]`
+- Subsequent prompts in the same invoke get `param.extra_args["nnsight_batch_member"] = True`
 - `vllm_entrypoint.generate(prompts, sampling_params)` is called
 
 **3. vLLM schedules the request:**
@@ -155,7 +164,7 @@ NNsight captures, parses, and compiles the intervention code into a `Mediator`.
 - The worker's `_update_states()` is called with the scheduler output
 
 **4. `NNsightGPUModelRunner._update_states()`:**
-- Calls `process_new_reqs()` — deserializes mediators from new requests' `SamplingParams`
+- Calls `process_new_reqs()` — checks `extra_args` for `"nnsight_mediator"` bytes and deserializes them; uses `"nnsight_batch_member"` to associate subsequent prompts with the same mediator
 - Calls `process_batch_groups()` — computes each mediator's `[start_token, num_tokens]` batch group based on scheduled token counts
 - Registers mediators with the interleaver
 
@@ -177,10 +186,10 @@ NNsight captures, parses, and compiles the intervention code into a `Mediator`.
 
 **8. When all requests in an invoke group finish:**
 - `NNsightLLMEngine.step()` detects finished requests
-- Calls `finish_nnsight(finished_requests)` on the executor → worker → model runner
+- Calls `finish_nnsight(finished_requests)` on the executor -> worker -> model runner
 - Model runner enters interleaver, calls `interleaver.handle("result", outputs)` — mediators can interact with final output
 - Extracts saved values from mediator frames (any variable marked with `.save()`)
-- Returns saves dict, which gets attached to the `RequestOutput`
+- Returns saves dict (pickled to bytes so it survives msgpack transport in multiprocessing mode), which gets attached to the `RequestOutput`
 
 **9. Back in user process:**
 - `VLLM.__call__()` receives the `RequestOutput` with attached saves
@@ -200,6 +209,7 @@ When `dispatch=False` (default), the model is loaded with meta tensors (no real 
 
 When `dispatch=True` or when `interleave()` auto-dispatches:
 - Destroys any existing distributed environment
+- If `distributed_executor_backend="ray"`, replaces it with `NNsightRayExecutor` class (see [Ray Distributed Executor](#ray-distributed-executor))
 - Creates a `vllm.LLM` instance with `enforce_eager=True`
 - Sets the worker class to `NNsightGPUWorker` via `worker_cls` kwarg
 - After creation, monkey-patches the engine class to `NNsightLLMEngine`
@@ -216,25 +226,21 @@ This means there are **two VLLM instances**: one in the user process (for tracin
 
 ---
 
-## Mediator Transport via SamplingParams
+## Mediator Transport via extra_args
 
 The core challenge: intervention code is compiled into a `Mediator` in the user process, but must execute in the worker process.
 
 ### How It Works
 
 1. During tracing, each invoke produces a `Mediator` containing the compiled intervention function.
-2. `VLLM.__call__()` creates `NNsightSamplingParams` with the mediator attached.
-3. `NNsightSamplingParams.__reduce__()` serializes the mediator to bytes using `save()` (which uses `pickle` + `dill` for closures).
-4. vLLM's internal pipeline pickles the `SamplingParams` when passing to worker processes.
-5. In the worker, `process_new_reqs()` checks if the mediator is bytes and deserializes it using `load()`, passing the worker-side model as context.
+2. `VLLM.__call__()` serializes the mediator to bytes via `serialize()` and stores it in `param.extra_args = {"nnsight_mediator": <bytes>}`. Subsequent prompts in the same invoke get `param.extra_args = {"nnsight_batch_member": True}`.
+3. `SamplingParams.extra_args` is a built-in `dict[str, Any] | None` field that survives vLLM's internal msgpack serialization when passing to worker processes (both multiprocessing and Ray).
+4. In the worker, `process_new_reqs()` checks `extra_args` for `"nnsight_mediator"` bytes and deserializes using `load()`, passing the worker-side model's persistent objects for reference resolution.
+5. Batch members (prompts after the first in an invoke) are identified by the `"nnsight_batch_member"` marker and associated with the most recently deserialized mediator.
 
-### Why SamplingParams?
+### Why extra_args?
 
-vLLM already passes `SamplingParams` through its entire pipeline — from engine to scheduler to worker to model runner. Attaching mediators here avoids creating a separate transport mechanism. Each prompt in the batch has its own `SamplingParams`, so each can carry a different mediator (or the same one for prompts in the same invoke).
-
-### Cloning
-
-vLLM clones `SamplingParams` internally. `NNsightSamplingParams.clone()` ensures the mediator reference is preserved (not deep-copied) so all prompts in the same invoke share the same mediator instance.
+vLLM already passes `SamplingParams` through its entire pipeline — from engine to scheduler to worker to model runner. The `extra_args` dict is a built-in field on `SamplingParams` that survives all serialization boundaries (pickle for Ray, msgpack for multiprocessing). This avoids creating a separate transport mechanism and doesn't require a custom `__reduce__()` implementation.
 
 ---
 
@@ -246,11 +252,11 @@ Standard NNsight uses `[batch, tokens, hidden]` tensors. vLLM concatenates all t
 
 ```
 Standard NNsight:
-  Prompt "Hello World" (5 tokens):  [1, 5, 768]  → batch_group = [0, 1]
-  Prompt "Hi" (2 tokens):           [1, 2, 768]  → batch_group = [1, 1]
+  Prompt "Hello World" (5 tokens):  [1, 5, 768]  -> batch_group = [0, 1]
+  Prompt "Hi" (2 tokens):           [1, 2, 768]  -> batch_group = [1, 1]
 
 vLLM (flat):
-  All tokens concatenated:          [7, 768]      → batch_group = [0, 5] for "Hello World"
+  All tokens concatenated:          [7, 768]      -> batch_group = [0, 5] for "Hello World"
                                                      batch_group = [5, 2] for "Hi"
 ```
 
@@ -321,7 +327,7 @@ After intervention code runs and returns (potentially modified) values, post-hoo
 
 | Layer Type | Access | Re-shard Operation |
 |------------|--------|--------------------|
-| `ColumnParallelLinear` | output | `split_tensor_along_last_dim` → take `tp_rank` shard |
+| `ColumnParallelLinear` | output | `split_tensor_along_last_dim` -> take `tp_rank` shard |
 | `RowParallelLinear` | output | Divide by `tp_size` (to undo the all-reduce) |
 
 Every GPU runs the **same intervention code** on the **same complete tensor**, ensuring consistency across the distributed system.
@@ -334,7 +340,7 @@ vLLM uses continuous batching: new requests can join and finished requests can l
 
 ### How NNsight Handles This
 
-**New requests**: `process_new_reqs()` deserializes mediators and registers them with the interleaver.
+**New requests**: `process_new_reqs()` checks `extra_args` for mediator bytes and deserializes them. Batch members are associated with the most recently deserialized mediator via the `"nnsight_batch_member"` marker.
 
 **Batch group updates**: `process_batch_groups()` recomputes batch groups every step based on what the scheduler has actually scheduled. Only currently-scheduled requests are reflected in batch groups.
 
@@ -342,7 +348,7 @@ vLLM uses continuous batching: new requests can join and finished requests can l
 1. Enters the interleaver and handles the `"result"` provider
 2. Extracts saved values from the mediator's frame locals
 3. Cancels the mediator
-4. Returns saved values, which get attached to `RequestOutput`
+4. Returns saved values (pickled to bytes), which get attached to `RequestOutput`
 
 After finishing, remaining active requests have their batch groups re-computed for subsequent steps.
 
@@ -354,20 +360,20 @@ When `max_tokens > 1`, the execute/sample cycle repeats for each token:
 
 ```
 Step 0 (prefill):
-  _update_states() → process new requests, compute batch groups
-  execute_model()  → forward pass, wrap logits
-  _sample()        → sample, wrap samples
+  _update_states() -> process new requests, compute batch groups
+  execute_model()  -> forward pass, wrap logits
+  _sample()        -> sample, wrap samples
 
 Step 1 (decode):
-  _update_states() → update batch groups (now 1 token per request)
-  execute_model()  → forward pass, wrap logits
-  _sample()        → sample, wrap samples
+  _update_states() -> update batch groups (now 1 token per request)
+  execute_model()  -> forward pass, wrap logits
+  _sample()        -> sample, wrap samples
 
 Step 2 (decode):
   ...same pattern...
 
 All requests in group finish:
-  finish_nnsight() → collect saves, cleanup
+  finish_nnsight() -> collect saves, cleanup
 ```
 
 ### Iteration Tracking
@@ -388,3 +394,84 @@ Each iteration of the loop corresponds to one generation step. The mediator's it
 ### Batch Group Differences: Prefill vs Decode
 
 During prefill (step 0), a request's batch group covers all prompt tokens: `[start, num_prompt_tokens]`. During decode (steps 1+), it covers a single token: `[start, 1]`. The `unflatten()` call after the forward pass normalizes these back to prompt-level regardless.
+
+---
+
+## Ray Distributed Executor
+
+vLLM supports multiple executor backends for distributing tensor-parallel workers across GPUs. The default is `"mp"` (multiprocessing), which spawns workers as local subprocesses. The `"ray"` backend uses Ray actors instead, enabling multi-node inference where TP workers can run on different machines.
+
+### The Problem
+
+vLLM v0.15.1 + Ray 2.53.0 have a compatibility issue where Ray actor processes crash during construction. When Ray creates a `RayWorkerWrapper` actor, it imports the module `vllm.v1.executor.ray_utils` in the actor process. This triggers transitive module-level imports:
+
+```
+ray_utils.py
+  -> worker_base.py
+    -> from vllm.multimodal import MULTIMODAL_REGISTRY
+      -> (heavy initialization of multimodal registries, torch ops, etc.)
+```
+
+These imports conflict with Ray's internal gRPC event engine (specifically grpcio's `cygrpc` C extension) during the actor construction phase, causing the actor process to die with a segfault before it is fully constructed. There is no Python traceback — the crash occurs at the C level.
+
+The same imports work fine when they happen during actor **method execution** (after the actor is fully constructed and Ray's gRPC connection is stable).
+
+### The Fix: LazyRayWorkerWrapper + NNsightRayExecutor
+
+`LazyRayWorkerWrapper` is a thin drop-in replacement for `RayWorkerWrapper` that has **no heavy module-level imports**. It defers all vLLM imports to `__init__` time, which runs during actor method execution rather than actor construction:
+
+```python
+class LazyRayWorkerWrapper:
+    def __init__(self, *args, **kwargs):
+        # This import happens AFTER actor construction,
+        # when Ray's gRPC connection is stable.
+        from vllm.v1.executor.ray_utils import RayWorkerWrapper
+        self._w = RayWorkerWrapper(*args, **kwargs)
+
+    # All methods explicitly defined (Ray actors can't use __getattr__)
+    def execute_method(self, method, *args, **kwargs):
+        return self._w.execute_method(method, *args, **kwargs)
+    # ... etc
+```
+
+`NNsightRayExecutor` is a subclass of `RayDistributedExecutor` that swaps in `LazyRayWorkerWrapper` before creating workers:
+
+```python
+class NNsightRayExecutor(RayDistributedExecutor):
+    def _init_executor(self) -> None:
+        import vllm.v1.executor.ray_utils as ray_utils
+        import vllm.v1.executor.ray_executor as ray_exec
+        ray_utils.RayWorkerWrapper = LazyRayWorkerWrapper
+        ray_exec.RayWorkerWrapper = LazyRayWorkerWrapper
+        super()._init_executor()
+```
+
+### How It's Integrated
+
+When the user passes `distributed_executor_backend="ray"`, `VLLM._load()` replaces the string with the `NNsightRayExecutor` class before passing it to `vllm.LLM()`:
+
+```python
+if kwargs.get("distributed_executor_backend") == "ray":
+    from .ray_workaround import NNsightRayExecutor
+    kwargs["distributed_executor_backend"] = NNsightRayExecutor
+```
+
+vLLM's `EngineArgs.distributed_executor_backend` accepts `str | type[Executor]`, so passing a class directly is supported. This is cleaner than external monkey-patching because:
+
+1. **Works with multiprocessing mode**: vLLM pickles the executor class to the EngineCore subprocess. `NNsightRayExecutor._init_executor()` runs inside that subprocess, where it swaps in `LazyRayWorkerWrapper` before any Ray actors are created. No need to force `VLLM_ENABLE_V1_MULTIPROCESSING=0`.
+2. **Self-contained**: The workaround is entirely within `NNsightRayExecutor` — no global state or env var overrides.
+3. **Transparent to users**: `VLLM("gpt2", distributed_executor_backend="ray")` just works.
+
+### Why the Existing Integration Is Executor-Agnostic
+
+The NNsight hooks (`worker_cls`, `collective_rpc`, `execute_model`) work identically across Ray and multiprocessing:
+
+- **`worker_cls`**: Both `MultiprocExecutor` and `RayDistributedExecutor` resolve the `worker_cls` string (`"nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker"`) and instantiate it. The monkey-patching of `GPUModelRunner -> NNsightGPUModelRunner` happens inside each worker process/actor.
+- **`execute_model`**: `RayWorkerWrapper.execute_model_ray()` calls `self.worker.model_runner.execute_model()` — the same path as multiprocessing. Since the model runner is `NNsightGPUModelRunner`, interventions execute correctly.
+- **`collective_rpc("finish_nnsight")`**: `RayDistributedExecutor.collective_rpc()` calls `worker.execute_method.remote()` which delegates to `self.worker.finish_nnsight()`. Return values (pickled bytes) survive Ray serialization.
+- **Mediator transport**: `SamplingParams.extra_args` with serialized mediator bytes passes through Ray's compiled DAG via pickle.
+
+### Limitations
+
+- **Pipeline parallelism (PP > 1)** is not supported with Ray. `finish_nnsight` only collects saves from `get_pp_group().rank == 0` (first pipeline stage). With PP > 1, saves from later stages are lost.
+- **Version sensitivity**: The actor crash is a grpcio/Ray compatibility issue. Tested with vLLM 0.15.1 + Ray 2.53.0 + grpcio 1.76.0. Future versions may fix the underlying crash, at which point `ray_workaround.py` can be simplified.
