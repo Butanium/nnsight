@@ -51,13 +51,18 @@ test = [
 ]
 
 
+diffusers = [
+    "diffusers",
+]
+
+
 vllm = [
     "vllm>=0.12",
     "triton==3.5.0",
 ]
 
 
-all = ["nnsight[test,vllm]"]
+all = ["nnsight[test,diffusers,vllm]"]
 
 [project.urls]
 Homepage = "https://github.com/ndif-team/nnsight"
