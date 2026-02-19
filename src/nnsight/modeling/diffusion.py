@@ -52,6 +52,7 @@ def _build_pipeline_from_config(
     automodel: type,
     repo_id: str,
     revision: Optional[str] = None,
+    config=None,
     **kwargs,
 ) -> DiffusionPipeline:
     """Build a diffusion pipeline with meta-device ``nn.Module`` components.
@@ -71,6 +72,8 @@ def _build_pipeline_from_config(
         automodel: The pipeline class (e.g. ``DiffusionPipeline``).
         repo_id: HuggingFace repository ID.
         revision: Git revision / branch / tag.
+        config: Pre-loaded pipeline config dict.  If ``None``, the
+            config is downloaded via ``automodel.load_config()``.
         **kwargs: User overrides (e.g. ``safety_checker=None``).
 
     Returns:
@@ -79,7 +82,8 @@ def _build_pipeline_from_config(
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
-    config = automodel.load_config(repo_id, revision=revision)
+    if config is None:
+        config = automodel.load_config(repo_id, revision=revision)
 
     pipe_cls_name = config.get("_class_name", automodel.__name__)
     pipe_cls = getattr(pipelines, pipe_cls_name, automodel)
@@ -179,7 +183,7 @@ class Diffuser(util.WrapperModule):
         pipeline (DiffusionPipeline): The underlying diffusers pipeline.
     """
 
-    def __init__(self, automodel_or_pipeline=DiffusionPipeline, *args, **kwargs) -> None:
+    def __init__(self, automodel_or_pipeline=DiffusionPipeline, *args, config=None,**kwargs) -> None:
         super().__init__()
 
         if isinstance(automodel_or_pipeline, DiffusionPipeline):
@@ -192,6 +196,8 @@ class Diffuser(util.WrapperModule):
                 value, PreTrainedTokenizerBase
             ):
                 setattr(self, key, value)
+
+        self.config = config
 
     def generate(self, *args, **kwargs):
         """Run the full diffusion pipeline.
@@ -260,9 +266,24 @@ class DiffusionModel(HuggingFaceModel):
             else getattr(pipelines, automodel)
         )
 
+        self.config = None
         self._model: Diffuser = None
 
         super().__init__(*args, **kwargs)
+
+    def _load_config(self, repo_id: str, revision: Optional[str] = None):
+        """Load and cache the pipeline's ``model_index.json`` config.
+
+        Mirrors :meth:`TransformersModel._load_config` so that
+        ``self.config`` is available before the model is fully loaded.
+        Only downloads the config once (subsequent calls are no-ops).
+
+        Args:
+            repo_id: HuggingFace repository ID.
+            revision: Git revision of the repository.
+        """
+        if self.config is None:
+            self.config = self.automodel.load_config(repo_id, revision=revision)
 
     def _load_meta(self, repo_id: str, revision: Optional[str] = None, **kwargs):
         """Load a meta (placeholder) version of the diffusion model.
@@ -283,11 +304,13 @@ class DiffusionModel(HuggingFaceModel):
         Returns:
             A :class:`Diffuser` instance with meta-device parameters.
         """
+        self._load_config(repo_id, revision=revision)
+
         pipeline = _build_pipeline_from_config(
-            self.automodel, repo_id, revision=revision, **kwargs
+            self.automodel, repo_id, revision=revision, config=self.config, **kwargs
         )
 
-        return Diffuser(pipeline)
+        return Diffuser(pipeline, config=self.config)
 
     def _load(
         self, repo_id: str, revision: Optional[str] = None, device_map=None, **kwargs
@@ -303,11 +326,12 @@ class DiffusionModel(HuggingFaceModel):
         Returns:
             A :class:`Diffuser` instance.
         """
+        self._load_config(repo_id, revision=revision)
 
         device_map = "balanced" if device_map == "auto" or device_map is None else device_map
 
         model = Diffuser(
-            self.automodel, repo_id, revision=revision, device_map=device_map, **kwargs
+            self.automodel, repo_id, revision=revision, device_map=device_map, config=self.config, **kwargs
         )
 
         return model
@@ -452,3 +476,6 @@ class DiffusionModel(HuggingFaceModel):
             The pipeline output passed through the wrapper module.
         """
         return self._run_pipeline(prepared_inputs, *args, **kwargs)
+
+    def _remoteable_model_key(self) -> str:
+        return super()._remoteable_model_key()
