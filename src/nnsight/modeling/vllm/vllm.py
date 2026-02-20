@@ -1,5 +1,6 @@
 from ... import NNS_VLLM_VERSION
 
+import atexit
 import uuid
 import vllm
 
@@ -101,11 +102,24 @@ class VLLM(RemoteableMixin):
                 tensor_model_parallel_size=1, pipeline_model_parallel_size=1
             )
 
+        atexit.register(VLLM._cleanup_distributed)
+
         super().__init__(*args, **kwargs)
 
         self.logits: Envoy = WrapperModule()
         self.samples: Envoy = WrapperModule()
         self.generator: Envoy = WrapperModule()
+
+    @staticmethod
+    def _cleanup_distributed():
+        try:
+            destroy_model_parallel()
+        except Exception:
+            pass
+        try:
+            destroy_distributed_environment()
+        except Exception:
+            pass
 
     def _load_meta(self, repo_id: str, **kwargs) -> "Module":
 

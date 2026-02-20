@@ -151,6 +151,53 @@ Custom `RayDistributedExecutor` subclass passed as `distributed_executor_backend
 
 ---
 
+## Input Model: One Prompt Per Invoke
+
+### Why One Prompt Per Invoke?
+
+Unlike `LanguageModel` where a single invoke can contain a batch of prompts (`tracer.invoke(["Hello", "World"])`), vLLM requires **exactly one prompt per invoke**.
+
+This is an architectural constraint, not a limitation of NNsight. In vLLM, each prompt becomes an independent **request** with its own:
+- Request ID and lifecycle (scheduled, running, finished independently)
+- Scheduling decisions (may be chunked, preempted, or batched differently per step)
+- Sampling parameters (temperature, top_p, max_tokens, stop conditions)
+- Finish condition (each request stops independently when it hits its stop token or max_tokens)
+
+Each invoke produces one `Mediator`, and each mediator maps 1:1 to a `SamplingParams` which maps 1:1 to a vLLM request. If one invoke could contain multiple prompts, a single mediator would need to track multiple independent requests that may be scheduled at different times, finish at different times, and have different token counts per step — breaking batch group management entirely.
+
+`_prepare_input()` enforces this and raises `ValueError` if multiple prompts are passed to a single invoke.
+
+### Batching Pattern
+
+Use a loop of invokes to process multiple prompts. Each invoke runs its intervention code independently, but all prompts are batched together by vLLM's engine for efficient execution:
+
+```python
+prompts = ["Prompt A", "Prompt B", "Prompt C"]
+
+with model.trace(max_tokens=512) as tracer:
+    # Shared state defined at trace scope
+    out_ids = [list() for _ in range(len(prompts))].save()
+
+    for i, prompt in enumerate(prompts):
+        with tracer.invoke(prompt):
+            # Each invoke = one prompt = one vLLM request
+            with tracer.all():
+                out_ids[i].append(model.samples.output.item())
+
+# Access results after the trace
+for i, ids in enumerate(out_ids):
+    print(model.tokenizer.decode(ids))
+```
+
+Key points:
+- **Each `tracer.invoke(prompt)` becomes one vLLM request** — vLLM batches them internally for GPU efficiency
+- **Shared state across invokes** (like `out_ids` above) works via globals grafting on the worker (see [Cross-Invoke Shared State](#cross-invoke-shared-state))
+- **Per-invoke sampling params**: pass kwargs to individual invokes to control each request independently (e.g., `tracer.invoke(prompt, temperature=0.8)`)
+- **`tracer.all()`** applies the intervention body to every generation step (equivalent to `tracer.iter[:]` but recursive)
+- **Empty invokes** (`tracer.invoke()` with no args) still work — they see the full batch across all requests, useful for batch-wide observations
+
+---
+
 ## Execution Flow
 
 ### End-to-End: From User Trace to Saved Values
