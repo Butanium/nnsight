@@ -272,15 +272,20 @@ class VisionLanguageModel(LanguageModel):
                 else labels
             )
 
-        if attention_mask is not None:
-            if self.tokenizer.padding_side == "left":
-                new_batched_inputs["attention_mask"][
-                    : attention_mask.shape[0], -attention_mask.shape[1] :
-                ] = attention_mask
-            else:
-                new_batched_inputs["attention_mask"][
-                    : attention_mask.shape[0], : attention_mask.shape[1]
-                ] = attention_mask
+        new_attention_mask = prepared_kwargs.get("attention_mask", None)
+        n_old = attention_mask.shape[0] if attention_mask is not None else 0
+        left = self.tokenizer.padding_side == "left"
+
+        combined_mask = torch.zeros_like(new_batched_inputs["attention_mask"])
+
+        for row_start, mask in [(0, attention_mask), (n_old, new_attention_mask)]:
+            if mask is not None:
+                if left:
+                    combined_mask[row_start : row_start + mask.shape[0], -mask.shape[1] :] = mask
+                else:
+                    combined_mask[row_start : row_start + mask.shape[0], : mask.shape[1]] = mask
+
+        new_batched_inputs["attention_mask"] = combined_mask
 
         # ---- Handle image tensors (pixel_values, image_sizes, etc.) ----
         # Collect all keys that are not text-related
