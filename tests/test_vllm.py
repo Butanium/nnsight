@@ -10,7 +10,6 @@ These tests cover vLLM-specific features:
 - Tensor parallelism
 """
 
-import os
 import pytest
 import torch
 from typing import TYPE_CHECKING
@@ -25,15 +24,6 @@ try:
     _has_ray = True
 except ImportError:
     _has_ray = False
-
-# Multi-prompt-per-invoke tests are incompatible with vLLM's multiprocessing
-# mode due to a batch scheduling race: the EngineCore subprocess can prefill
-# requests from the same invoke in separate scheduler steps, breaking the
-# assumption that all batch members are processed together.
-_mp_skip = pytest.mark.skipif(
-    os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") != "0",
-    reason="Multi-prompt batch tests require in-process mode (VLLM_ENABLE_V1_MULTIPROCESSING=0)",
-)
 
 _ray_skip = pytest.mark.skipif(
     not _has_ray or torch.cuda.device_count() < 2,
@@ -257,55 +247,6 @@ class TestBatching:
         assert clean_token == " Paris"
         assert corrupted_token == " London"
 
-    @_mp_skip
-    @torch.no_grad()
-    def test_batched_multi_token_generation(
-        self, vllm_gpt2, ET_prompt: str, MSG_prompt: str
-    ):
-        """Test multi-token generation with batched inputs."""
-        max_token_1: int = 3
-        max_token_2: int = 5
-        num_prompts_1: int = 2
-        num_prompts_2: int = 1
-
-        with vllm_gpt2.trace() as tracer:
-            with tracer.invoke([MSG_prompt, ET_prompt], max_tokens=max_token_1):
-                MSG_ET_hs = list().save()
-                MSG_ET_logits = list().save()
-                MSG_ET_samples = list().save()
-                with tracer.iter[:]:
-                    MSG_ET_hs.append(vllm_gpt2.transformer.h[5].output)
-                    MSG_ET_logits.append(vllm_gpt2.logits.output)
-                    MSG_ET_samples.append(vllm_gpt2.samples.output)
-
-            with tracer.invoke(MSG_prompt, max_tokens=max_token_2):
-                MSG_hs = list().save()
-                MSG_logits = list().save()
-                MSG_samples = list().save()
-                with tracer.iter[:]:
-                    MSG_hs.append(vllm_gpt2.transformer.h[5].output)
-                    MSG_logits.append(vllm_gpt2.logits.output)
-                    MSG_samples.append(vllm_gpt2.samples.output)
-
-        assert len(MSG_ET_hs) == max_token_1
-        assert all(hs.shape[0] == num_prompts_1 for hs in MSG_ET_hs[1:])
-
-        assert len(MSG_ET_logits) == max_token_1
-        assert all(logit.shape[0] == num_prompts_1 for logit in MSG_ET_logits)
-
-        assert len(MSG_ET_samples) == max_token_1
-        assert all(sample.shape[0] == num_prompts_1 for sample in MSG_ET_samples)
-
-        assert len(MSG_hs) == max_token_2
-        assert all(hs.shape[0] == num_prompts_2 for hs in MSG_hs[1:])
-
-        assert len(MSG_logits) == max_token_2
-        assert all(logit.shape[0] == num_prompts_2 for logit in MSG_logits)
-
-        assert len(MSG_samples) == max_token_2
-        assert all(sample.shape[0] == num_prompts_2 for sample in MSG_samples)
-
-    @_mp_skip
     @torch.no_grad()
     def test_batched_multi_token_with_iter(
         self, vllm_gpt2, ET_prompt: str, MSG_prompt: str
@@ -324,69 +265,6 @@ class TestBatching:
 
         assert len(ET_logits) == 6
         assert len(MSG_logits) == 5
-
-
-# =============================================================================
-# Invoker Batching
-# =============================================================================
-
-
-# class TestInvokerBatching:
-#     """Tests for invoker group batching."""
-
-# @torch.no_grad()
-# def test_invoker_group_batching(self, vllm_gpt2, ET_prompt: str, MSG_prompt: str):
-#     """Test complex invoker group batching."""
-#     max_tokens_1 = 1
-#     max_tokens_2 = 2
-#     max_tokens_3 = 3
-
-#     MSG_logits = list()
-#     ET_logits = list()
-#     two_prompts_logits = list()
-#     all_logits = list()
-
-#     with vllm_gpt2.trace() as tracer:
-#         with tracer.invoke(MSG_prompt, max_tokens=max_tokens_1):
-#             with tracer.iter[:]:
-#                 MSG_logits.append(vllm_gpt2.logits.output)
-
-#         with tracer.invoke():
-#             with tracer.all():
-#                 all_logits.append(vllm_gpt2.logits.output)
-
-#         with tracer.invoke([ET_prompt, MSG_prompt], max_tokens=max_tokens_3):
-#             with tracer.all():
-#                 two_prompts_logits.append(vllm_gpt2.logits.output)
-
-#         with tracer.invoke(ET_prompt, max_tokens=max_tokens_2):
-#             with tracer.iter[:]:
-#                 ET_logits.append(vllm_gpt2.logits.output)
-
-#     # Each invoker has the correct number of logits
-#     assert len(MSG_logits) == max_tokens_1
-#     assert len(ET_logits) == max_tokens_2
-#     assert len(two_prompts_logits) == max_tokens_3
-#     assert len(all_logits) == max_tokens_3
-
-#     # Check correctness of prompt-less invoker
-#     assert (
-#         all_logits[0].shape[0] == 4
-#         and all_logits[1].shape[0] == 3
-#         and all_logits[2].shape[0] == 2
-#     )
-
-#     # iter 0
-#     assert torch.equal(all_logits[0][0], MSG_logits[0][0])
-#     assert torch.equal(all_logits[0][1:3], two_prompts_logits[0][:2])
-#     assert torch.equal(all_logits[0][3], ET_logits[0][0])
-
-#     # iter 1
-#     assert torch.equal(all_logits[1][0:2], two_prompts_logits[1])
-#     assert torch.equal(all_logits[1][2], ET_logits[1][0])
-
-#     # iter 2
-#     assert torch.equal(all_logits[2], two_prompts_logits[2])
 
 
 # =============================================================================
@@ -437,20 +315,6 @@ class TestTokenInputs:
         next_token = vllm_gpt2.tokenizer.decode(logits.argmax(dim=-1))
         assert next_token == " Paris"
 
-    @_mp_skip
-    @torch.no_grad()
-    def test_batched_token_lists(self, vllm_gpt2, ET_prompt: str, MSG_prompt: str):
-        """Test passing multiple lists of token IDs."""
-        et_tokens = vllm_gpt2.tokenizer.encode(ET_prompt)
-        msg_tokens = vllm_gpt2.tokenizer.encode(MSG_prompt)
-
-        with vllm_gpt2.trace([et_tokens, msg_tokens], temperature=0.0, top_p=1):
-            logits = vllm_gpt2.logits.output.save()
-
-        assert logits.shape[0] == 2
-        tokens = vllm_gpt2.tokenizer.batch_decode(logits.argmax(dim=-1))
-        assert tokens == [" Paris", " New"]
-
     @torch.no_grad()
     def test_hf_tokenizer_dict_single(self, vllm_gpt2, ET_prompt: str):
         """Test passing HuggingFace tokenizer output dict for single prompt."""
@@ -461,41 +325,6 @@ class TestTokenInputs:
 
         next_token = vllm_gpt2.tokenizer.decode(logits.argmax(dim=-1))
         assert next_token == " Paris"
-
-    @_mp_skip
-    @torch.no_grad()
-    def test_hf_tokenizer_dict_batched(
-        self, vllm_gpt2, ET_prompt: str, MSG_prompt: str
-    ):
-        """Test passing HuggingFace tokenizer output dict for batched prompts."""
-        hf_output = vllm_gpt2.tokenizer(
-            [ET_prompt, MSG_prompt], return_tensors="pt", padding=True
-        )
-
-        with vllm_gpt2.trace(dict(hf_output), temperature=0.0, top_p=1):
-            logits = vllm_gpt2.logits.output.save()
-
-        assert logits.shape[0] == 2
-        tokens = vllm_gpt2.tokenizer.batch_decode(logits.argmax(dim=-1))
-        assert tokens == [" Paris", " New"]
-
-    @_mp_skip
-    @torch.no_grad()
-    def test_hf_tokenizer_with_padding_mask(self, vllm_gpt2):
-        """Test that padding tokens are correctly filtered via attention_mask."""
-        short_prompt = "Hello"
-        long_prompt = "The Eiffel Tower is located in the city of"
-
-        hf_output = vllm_gpt2.tokenizer(
-            [short_prompt, long_prompt], return_tensors="pt", padding=True
-        )
-
-        with vllm_gpt2.trace(dict(hf_output), temperature=0.0, top_p=1):
-            logits = vllm_gpt2.logits.output.save()
-
-        assert logits.shape[0] == 2
-        tokens = vllm_gpt2.tokenizer.batch_decode(logits.argmax(dim=-1))
-        assert tokens[1] == " Paris"
 
     @torch.no_grad()
     def test_token_list_in_invoker(self, vllm_gpt2, ET_prompt: str):
@@ -619,3 +448,52 @@ class TestRayExecutor:
             False,
             False,
         ]
+
+
+# =============================================================================
+# Cross-Invoke Shared State
+# =============================================================================
+
+
+class TestCrossInvokeSharedState:
+    """Tests for shared state across invokes (e.g., shared saved lists)."""
+
+    @torch.no_grad()
+    def test_shared_list_across_invokes(self, vllm_gpt2, ET_prompt: str, MSG_prompt: str):
+        """Test that a shared saved list collects values from multiple invokes."""
+        prompts = [ET_prompt, MSG_prompt]
+
+        with vllm_gpt2.trace(temperature=0.0, top_p=1) as tracer:
+            out_ids = [list() for _ in range(len(prompts))].save()
+            for i, prompt in enumerate(prompts):
+                with tracer.invoke(prompt):
+                    out_ids[i].append(vllm_gpt2.logits.output.argmax(dim=-1))
+
+        # Each sub-list should have exactly one entry (single-token generation)
+        assert len(out_ids) == 2
+        assert len(out_ids[0]) == 1
+        assert len(out_ids[1]) == 1
+
+        # Verify the predictions are correct
+        et_token = vllm_gpt2.tokenizer.decode(out_ids[0][0])
+        msg_token = vllm_gpt2.tokenizer.decode(out_ids[1][0])
+        assert et_token == " Paris"
+        assert msg_token == " New"
+
+    @torch.no_grad()
+    def test_shared_list_multi_token(self, vllm_gpt2, ET_prompt: str, MSG_prompt: str):
+        """Test shared list with multi-token generation using tracer.all()."""
+        prompts = [ET_prompt, MSG_prompt]
+        num_tokens = 3
+
+        with vllm_gpt2.trace(temperature=0.0, top_p=1, max_tokens=num_tokens) as tracer:
+            out_ids = [list() for _ in range(len(prompts))].save()
+            for i, prompt in enumerate(prompts):
+                with tracer.invoke(prompt):
+                    with tracer.all():
+                        out_ids[i].append(vllm_gpt2.logits.output.argmax(dim=-1))
+
+        # Each sub-list should have num_tokens entries
+        assert len(out_ids) == 2
+        assert len(out_ids[0]) == num_tokens
+        assert len(out_ids[1]) == num_tokens

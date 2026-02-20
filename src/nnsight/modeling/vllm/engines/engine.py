@@ -28,6 +28,5 @@ class NNsightLLMEngine(LLMEngine):
                 for ro in request_outputs:
                     if ro.finished:
                         ro.saves = saves
-                        break
 
         return request_outputs

@@ -166,8 +166,8 @@ NNsight captures, parses, and compiles the intervention code into a `Mediator`.
 **2. `VLLM.__call__()` is invoked:**
 - `_prepare_input()` normalizes the input (tokenizes strings, etc.)
 - `_batch()` combines inputs from all invokes
-- Each invoke's mediator is serialized to bytes via `serialize()` and stored in `param.extra_args["nnsight_mediator"]`
-- Subsequent prompts in the same invoke get `param.extra_args["nnsight_batch_member"] = True`
+- Computes `saved_names` (parent-scope variables in `Globals.saves`) and generates a `trace_id`
+- Each invoke's mediator is serialized independently via `serialize()` and stored in `param.extra_args` with trace metadata (`nnsight_mediator`, `nnsight_trace_id`, `nnsight_trace_idx`, `nnsight_saved_names`, `nnsight_expected_count`)
 - `vllm_entrypoint.generate(prompts, sampling_params)` is called
 
 **3. vLLM schedules the request:**
@@ -175,7 +175,7 @@ NNsight captures, parses, and compiles the intervention code into a `Mediator`.
 - The worker's `_update_states()` is called with the scheduler output
 
 **4. `NNsightGPUModelRunner._update_states()`:**
-- Calls `process_new_reqs()` — checks `extra_args` for `"nnsight_mediator"` bytes and deserializes them; uses `"nnsight_batch_member"` to associate subsequent prompts with the same mediator
+- Calls `process_new_reqs()` — deserializes each mediator from `extra_args["nnsight_mediator"]`; for the first mediator of a `trace_id`, stores its `__globals__` as canonical; subsequent mediators get shared variables grafted from the canonical globals
 - Calls `process_batch_groups()` — computes each mediator's `[start_token, num_tokens]` batch group based on scheduled token counts
 - Registers mediators with the interleaver
 
@@ -239,15 +239,43 @@ This means there are **two VLLM instances**: one in the user process (for tracin
 
 ## Mediator Transport via extra_args
 
-The core challenge: intervention code is compiled into a `Mediator` in the user process, but must execute in the worker process.
+The core challenge: intervention code is compiled into a `Mediator` in the user process, but must execute in the worker process. Additionally, multiple invokes within a single trace may share parent-scope variables (e.g., a saved list that each invoke appends to).
 
 ### How It Works
 
 1. During tracing, each invoke produces a `Mediator` containing the compiled intervention function.
-2. `VLLM.__call__()` serializes the mediator to bytes via `serialize()` and stores it in `param.extra_args = {"nnsight_mediator": <bytes>}`. Subsequent prompts in the same invoke get `param.extra_args = {"nnsight_batch_member": True}`.
-3. `SamplingParams.extra_args` is a built-in `dict[str, Any] | None` field that survives vLLM's internal msgpack serialization when passing to worker processes (both multiprocessing and Ray).
-4. In the worker, `process_new_reqs()` checks `extra_args` for `"nnsight_mediator"` bytes and deserializes using `load()`, passing the worker-side model's persistent objects for reference resolution.
-5. Batch members (prompts after the first in an invoke) are identified by the `"nnsight_batch_member"` marker and associated with the most recently deserialized mediator.
+2. `VLLM.__call__()` computes `saved_names` — parent-frame variable names whose values are in `Globals.saves` (i.e., variables defined at trace scope with `.save()`). It also generates a `trace_id` UUID to group all mediators from the same trace.
+3. Each mediator is serialized independently via `serialize()` and stored in `param.extra_args` along with trace metadata:
+   ```python
+   param.extra_args = {
+       "nnsight_mediator": serialize(mediator),  # per-mediator bytes
+       "nnsight_trace_id": trace_id,             # groups mediators from same trace
+       "nnsight_trace_idx": idx,                 # ordering within the trace
+       "nnsight_saved_names": saved_names,        # shared variable names
+       "nnsight_expected_count": count,           # total mediators in this trace
+   }
+   ```
+4. `SamplingParams.extra_args` is a built-in `dict[str, Any] | None` field that survives vLLM's internal msgpack serialization when passing to worker processes (both multiprocessing and Ray).
+5. In the worker, `process_new_reqs()` deserializes each mediator independently. The first mediator to arrive for a given `trace_id` has its `__globals__` stored as the canonical reference. Subsequent mediators for the same trace have the saved variable entries in their `__globals__` replaced with references from the canonical globals, so all mediators share the same Python objects for cross-invoke state.
+
+### Cross-Invoke Shared State
+
+When users define variables in the parent trace scope and reference them inside multiple invokes (e.g., a shared list that each invoke appends to), the worker-side globals grafting ensures all mediators operate on the same Python objects:
+
+```python
+with model.trace(max_tokens=3) as tracer:
+    out_ids = [list() for i in range(len(prompts))].save()  # parent-scope saved var
+    for i, prompt in enumerate(prompts):
+        with tracer.invoke(prompt):
+            with tracer.all():
+                out_ids[i].append(model.logits.output)  # mutates shared list
+```
+
+On the worker:
+- Mediator 0 arrives first; its `__globals__["out_ids"]` becomes the canonical object
+- Mediator 1 arrives later; its `__globals__["out_ids"]` is replaced with mediator 0's copy
+- Both mediators now mutate the same list in-place
+- Shared saves are collected only after ALL mediators for the trace have been received and completed (`received_count == expected_count` and `pending_req_ids` is empty), preventing premature cleanup if the scheduler completes one request before another is even scheduled
 
 ### Why extra_args?
 
@@ -351,17 +379,15 @@ vLLM uses continuous batching: new requests can join and finished requests can l
 
 ### How NNsight Handles This
 
-**New requests**: `process_new_reqs()` checks `extra_args` for mediator bytes and deserializes them. Batch members are associated with the most recently deserialized mediator via the `"nnsight_batch_member"` marker.
+**New requests**: `process_new_reqs()` deserializes each mediator from `extra_args["nnsight_mediator"]`. The first mediator for a `trace_id` establishes the canonical `__globals__`; subsequent mediators have their shared variables grafted from the canonical copy (see [Cross-Invoke Shared State](#cross-invoke-shared-state)).
 
 **Batch group updates**: `process_batch_groups()` recomputes batch groups every step based on what the scheduler has actually scheduled. Only currently-scheduled requests are reflected in batch groups.
 
-**Finished requests**: When all requests belonging to an invoke group are finished (per-invoke-group, not per-request), `finish_nnsight()`:
-1. Enters the interleaver and handles the `"result"` provider
-2. Extracts saved values from the mediator's frame locals
-3. Cancels the mediator
-4. Returns saved values (pickled to bytes), which get attached to `RequestOutput`
+**Finished requests**: `finish_nnsight()` handles two kinds of saves:
+1. **Per-invoke saves**: Variables `.save()`-ed inside an invoke are collected from each mediator's `info.frame.f_locals` (unchanged from before).
+2. **Trace-shared saves**: Variables `.save()`-ed at trace scope are collected from the canonical `__globals__` only after ALL mediators for the trace have been received and completed (`received_count == expected_count` and `pending_req_ids` is empty).
 
-After finishing, remaining active requests have their batch groups re-computed for subsequent steps.
+The deferred cleanup prevents premature collection when the scheduler completes one request before another is even scheduled. The `NNsightLLMEngine.step()` attaches saves to all finished request outputs (not just the first), ensuring deferred shared saves are always discoverable by the client.
 
 ---
 

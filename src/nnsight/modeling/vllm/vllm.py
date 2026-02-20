@@ -1,5 +1,6 @@
 from ... import NNS_VLLM_VERSION
 
+import uuid
 import vllm
 
 # Check vLLM version compatibility
@@ -29,6 +30,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.llm import LLM
 
 from ...intervention.envoy import Envoy
+from ...intervention.tracing.globals import Globals
 from ...intervention.tracing.tracer import ScanningTracer
 from ...intervention.tracing.util import push_variables
 from ...util import WrapperModule
@@ -161,11 +163,14 @@ class VLLM(RemoteableMixin):
     def _prepare_input(
         self, *args, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
-        """Normalize user inputs into ``((prompts, params), kwargs, batch_size)``.
+        """Normalize a single user input into ``((prompts, params), kwargs, batch_size)``.
 
-        Accepts strings, token ID lists, or HuggingFace tokenizer
-        outputs and converts them into vLLM-compatible prompt objects
-        with :class:`NNsightSamplingParams`.
+        Accepts a single string, a single token ID list, or a single-sequence
+        HuggingFace tokenizer output and converts it into a vLLM-compatible
+        prompt with :class:`NNsightSamplingParams`.
+
+        Each invoke must contain exactly one prompt.  To process multiple
+        prompts, use separate ``tracer.invoke()`` calls.
 
         Returns:
             Tuple of ``((prompts, params), kwargs, batch_size)``.
@@ -193,40 +198,54 @@ class VLLM(RemoteableMixin):
                     if batch_input_ids == []:
                         raise ValueError("Empty list of token ids is not allowed")
                     if isinstance(batch_input_ids[0], int):
-                        # list of token ids
+                        # single sequence of token ids
                         batch_input_ids = [batch_input_ids]
                         batch_attention_mask = [batch_attention_mask]
 
-                    for input_ids, attention_mask in zip(
-                        batch_input_ids, batch_attention_mask
-                    ):
-                        prompt = TokensPrompt(
-                            prompt_token_ids=[
-                                t for t, m in zip(input_ids, attention_mask) if m != 0
-                            ]
+                    if len(batch_input_ids) > 1:
+                        raise ValueError(
+                            "Multiple prompts per invoke are not supported. "
+                            "Use separate tracer.invoke() calls for each prompt."
                         )
-                        prompts.append(prompt)
-                        params.append(NNsightSamplingParams(**kwargs))
+
+                    input_ids = batch_input_ids[0]
+                    attention_mask = batch_attention_mask[0]
+                    prompt = TokensPrompt(
+                        prompt_token_ids=[
+                            t for t, m in zip(input_ids, attention_mask) if m != 0
+                        ]
+                    )
+                    prompts.append(prompt)
+                    params.append(NNsightSamplingParams(**kwargs))
                     continue
 
-            if type(arg) is not list or isinstance(arg[0], int):
-                # if arg is a list of ints (token ids), we also need to wrap it in a list
+            if type(arg) is list and isinstance(arg[0], int):
+                # single list of token ids
                 arg = [arg]
-
-            for i, prompt in enumerate(arg):
-
-                param = NNsightSamplingParams(
-                    **kwargs,
+            elif type(arg) is not list:
+                # single string
+                arg = [arg]
+            else:
+                # arg is a list but not of ints — reject multi-prompt
+                raise ValueError(
+                    "Multiple prompts per invoke are not supported. "
+                    "Use separate tracer.invoke() calls for each prompt."
                 )
 
-                if kwargs != {}:
-                    param.is_default_param = False
+            prompt = arg[0]
 
-                if type(prompt) is list and isinstance(prompt[0], int):
-                    prompt = TokensPrompt(prompt_token_ids=prompt)
+            param = NNsightSamplingParams(
+                **kwargs,
+            )
 
-                prompts.append(prompt)
-                params.append(param)
+            if kwargs != {}:
+                param.is_default_param = False
+
+            if type(prompt) is list and isinstance(prompt[0], int):
+                prompt = TokensPrompt(prompt_token_ids=prompt)
+
+            prompts.append(prompt)
+            params.append(param)
 
         kwargs = kwargs if not args else {}
 
@@ -262,47 +281,50 @@ class VLLM(RemoteableMixin):
         Attaches mediators to sampling params so the vLLM workers can
         deserialize and run intervention code, then collects saved
         variables from the outputs.
+
+        Each mediator maps to exactly one prompt/param (1:1).
         """
 
         default_param = NNsightSamplingParams.from_optional()
 
-        param_idx = 0
-
-        # Find the sampling params associated with each mediator
+        # Collect all input mediators (those with batch_group, i.e. not empty invokes)
+        input_mediators = []
         for mediator in self._interleaver.mediators:
+            if mediator.batch_group is not None:
+                mediator.intervention.__source__ = "".join(mediator.info.source)
+                input_mediators.append(mediator)
 
-            # If its the only invoker in the batch group, set the batch size to the total number of prompts
-            if mediator.batch_group is None:
-                batch_size = len(params)
+        # Compute saved_names: parent-frame variable names whose values are in Globals.saves.
+        # These are variables defined in the parent trace scope (e.g., shared lists)
+        # that need to be collected after all invokes complete on the worker.
+        saved_names = []
+        if input_mediators:
+            frame_globals = input_mediators[0].intervention.__globals__
+            saved_names = [
+                name for name, val in frame_globals.items()
+                if id(val) in Globals.saves
+            ]
 
-            else:
-                batch_size = mediator.batch_group[1]
+        trace_id = str(uuid.uuid4())
 
-            # For each prompt in the batch group associated with the mediator
-            for i in range(batch_size):
+        param_idx = 0
+        for idx, mediator in enumerate(input_mediators):
+            param = params[param_idx]
+            param.extra_args = {
+                "nnsight_mediator": serialize(mediator),
+                "nnsight_trace_id": trace_id,
+                "nnsight_trace_idx": idx,
+                "nnsight_saved_names": saved_names,
+                "nnsight_expected_count": len(input_mediators),
+            }
+            param_idx += 1
 
-                param = params[param_idx]
-
-                # If its the first prompt in the batch group, it will transfer the mediator to the workers
-                if i == 0:
-
-                    mediator.intervention.__source__ = "".join(mediator.info.source)
-                    param.extra_args = {"nnsight_mediator": serialize(mediator)}
-
-                else:
-                    # Mark subsequent prompts as batch members so the worker
-                    # can associate them with the same mediator, even if the
-                    # scheduler splits them across steps.
-                    param.extra_args = {"nnsight_batch_member": True}
-
-                param_idx += 1
-
-                # Update the sampling params for each prompt with any kwargs passed to the root trace
-                for attr, value in kwargs.items():
-                    if hasattr(NNsightSamplingParams, attr) and getattr(
-                        param, attr
-                    ) == getattr(default_param, attr):
-                        setattr(param, attr, value)
+            # Update the sampling params with any kwargs passed to the root trace
+            for attr, value in kwargs.items():
+                if hasattr(NNsightSamplingParams, attr) and getattr(
+                    param, attr
+                ) == getattr(default_param, attr):
+                    setattr(param, attr, value)
 
         # Do VLLM generation with NNsight
         outputs = self.vllm_entrypoint.generate(prompts, sampling_params=params)

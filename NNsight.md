@@ -2454,7 +2454,7 @@ vLLM integration provides high-performance inference with NNsight interventions.
 ┌─────────────────────────────────────────────────────────┐
 │  VLLM Class                                             │
 │  - Instantiates empty 'meta' model for envoy tree       │
-│  - Serializes mediator into extra_args on SamplingParams │
+│  - Serializes mediators + trace metadata into extra_args │
 │  - If Ray: swaps "ray" for NNsightRayExecutor class     │
 │  - Sends prompts + params to vLLM engine                │
 └───────┬───────────────────────────────────────▲─────────┘
@@ -2467,9 +2467,9 @@ vLLM integration provides high-performance inference with NNsight interventions.
         │                                       │
 ┌───────v───────────────────────────────────────┴──────────────────────────────────────────┐
 │  NNsightGPUModelRunner - Pre-wrapped NNsight model                                       │
-│  - Deserializes mediator from extra_args          finish_nnsight()                       │
+│  - Deserializes mediators, grafts shared globals  finish_nnsight()                       │
 │  - Manages batch groups (flat <-> unflatten)      4.) Handles "result" provider          │
-│  - Runs interleaving at multiple phases           - Collects saved values from frames    │
+│  - Runs interleaving at multiple phases           - Collects per-invoke + shared saves   │
 │    1.) Forward Pass                               - Returns pickled bytes                │
 │    2.) Logits                                                                            │
 │    3.) Sampling                                                                          │
@@ -2530,37 +2530,45 @@ The `VLLMBatcher.wrap()` adds hooks to all modules specifically for handling ten
 
 #### Mediator Transport via extra_args
 
-The challenge: Mediators (intervention code) are created in user code but must execute inside vLLM's model runner, potentially on different processes.
+The challenge: Mediators (intervention code) are created in user code but must execute inside vLLM's model runner, potentially on different processes. Additionally, multiple invokes within a single trace may share parent-scope variables (e.g., a saved list that each invoke appends to).
 
-**Solution:** Serialize mediators into the built-in `SamplingParams.extra_args` dict:
+**Solution:** Serialize each mediator independently into the built-in `SamplingParams.extra_args` dict, with trace metadata for cross-invoke shared state:
 
 ```python
 # In VLLM.__call__() — user process
-param.extra_args = {"nnsight_mediator": serialize(mediator)}
-
-# Subsequent prompts in the same invoke:
-param.extra_args = {"nnsight_batch_member": True}
+param.extra_args = {
+    "nnsight_mediator": serialize(mediator),  # per-mediator bytes
+    "nnsight_trace_id": trace_id,             # groups mediators from same trace
+    "nnsight_trace_idx": idx,                 # ordering within the trace
+    "nnsight_saved_names": saved_names,        # shared variable names
+    "nnsight_expected_count": count,           # total mediators in this trace
+}
 ```
 
 When a trace is created:
-1. Intervention code is compiled into a Mediator
-2. Mediator is serialized to bytes via `serialize()` and stored in `extra_args["nnsight_mediator"]`
-3. Subsequent prompts in the same invoke get `extra_args["nnsight_batch_member"] = True`
+1. Intervention code is compiled into Mediators (one per invoke)
+2. `saved_names` are computed — parent-frame variable names whose values are in `Globals.saves`
+3. Each mediator is serialized independently and stored in `extra_args` with a shared `trace_id`
 4. vLLM passes SamplingParams (with `extra_args`) through its pipeline — survives both msgpack (multiprocessing) and pickle (Ray)
-5. Model runner deserializes and executes the Mediator
+5. Model runner deserializes each mediator; the first arrival for a `trace_id` establishes canonical `__globals__`, subsequent arrivals graft shared variables from the canonical copy
 
 ```python
 # In NNsightRequestHelper.process_new_reqs() — worker process
-extra_args = getattr(new_req.sampling_params, 'extra_args', None)
-mediator_bytes = extra_args.get("nnsight_mediator") if extra_args else None
+mediator = load(extra_args["nnsight_mediator"], model._remoteable_persistent_objects())
 
-if mediator_bytes is not None:
-    self.last_mediator = load(mediator_bytes, model._remoteable_persistent_objects())
-    model._interleaver.mediators.append(self.last_mediator)
-
-elif extra_args and extra_args.get("nnsight_batch_member"):
-    # Associate with the most recently deserialized mediator
-    self.num_prompts_in_mediator[self.last_mediator] += 1
+if trace_id not in self.trace_contexts:
+    # First mediator: store canonical globals, register saved var ids
+    canonical_globals = mediator.intervention.__globals__
+    for name in saved_names:
+        if name in canonical_globals:
+            Globals.saves.add(id(canonical_globals[name]))
+    self.trace_contexts[trace_id] = {"canonical_globals": canonical_globals, ...}
+else:
+    # Subsequent mediator: graft saved vars from canonical globals
+    canonical = self.trace_contexts[trace_id]["canonical_globals"]
+    for name in saved_names:
+        if name in canonical:
+            mediator.intervention.__globals__[name] = canonical[name]
 ```
 
 `NNsightSamplingParams` is a thin subclass used only for type identification — no custom `__reduce__()` or mediator field needed.
@@ -2589,22 +2597,24 @@ vLLM (flat):
 class NNsightRequestHelper:
     def process_batch_groups(self, num_tokens_scheduled, requests, model):
         batch_start = 0
+        mediators = []
         for req_id, num_tokens in num_tokens_scheduled.items():
             mediator = self.mediators.get(req_id)
             if mediator is None:
                 batch_start += num_tokens
                 continue
+            mediators.append(mediator)
             # Batch group is [start_token, num_tokens] during forward
             mediator.batch_group = [batch_start, num_tokens]
             batch_start += num_tokens
+        model._interleaver.mediators = mediators
 
     def unflatten(self, model):
-        # After forward, switch to [start_prompt, num_prompts]
+        # After forward, switch to [start_prompt, 1] (one prompt per mediator)
         batch_start = 0
         for mediator in model._interleaver.mediators:
-            num_prompts = self.num_prompts_in_mediator[mediator]
-            mediator.batch_group = [batch_start, num_prompts]
-            batch_start += num_prompts
+            mediator.batch_group = [batch_start, 1]
+            batch_start += 1
 ```
 
 This allows:
@@ -2789,36 +2799,34 @@ def post_output_hook(module, args, output):
 
 #### Continuous Batching Support
 
-vLLM uses continuous batching: new requests join and finished requests leave mid-execution. NNsight handles this through `NNsightRequestHelper`, which maintains a `mediators` dict keyed by request ID (independent of vLLM's internal request tracking):
+vLLM uses continuous batching: new requests join and finished requests leave mid-execution. NNsight handles this through `NNsightRequestHelper`, which maintains a `mediators` dict keyed by request ID and a `trace_contexts` dict for cross-invoke shared state:
 
 ```python
 class NNsightRequestHelper:
     def __init__(self):
-        self.mediators: Dict[str, Any] = {}  # req_id -> Mediator
-        self.last_mediator = None             # persists across calls
+        self.mediators: Dict[str, Any] = {}      # req_id -> Mediator
+        self.trace_contexts: Dict[str, dict] = {} # trace_id -> context
 
     def process_batch_groups(self, num_tokens_scheduled, requests, model):
         batch_start = 0
-        seen_mediators = set()
+        mediators = []
         for req_id, num_tokens in num_tokens_scheduled.items():
             mediator = self.mediators.get(req_id)
             if mediator is None:
                 batch_start += num_tokens
                 continue
-            if mediator in seen_mediators:
-                mediator.batch_group[1] += num_tokens
-            else:
-                seen_mediators.add(mediator)
-                mediator.batch_group = [batch_start, num_tokens]
+            mediators.append(mediator)
+            mediator.batch_group = [batch_start, num_tokens]
             batch_start += num_tokens
 ```
 
 When requests finish, `finish_nnsight()` receives a list of finished request IDs from the engine:
 1. Matches request IDs to stored mediators
 2. Runs final interleaving for the "result" provider
-3. Collects saved values from mediator frames
-4. Returns pickled bytes (survives msgpack transport in multiprocessing mode)
-5. Cleans up mediator entries
+3. Collects per-invoke saved values from mediator frames
+4. Collects trace-shared saved values from canonical `__globals__` (only when ALL mediators for a trace have been received and completed)
+5. Returns pickled bytes (survives msgpack transport in multiprocessing mode)
+6. Cleans up mediator entries and completed trace contexts
 
 ```python
 def finish_nnsight(self, finished_req_ids: list[str]) -> Optional[bytes]:
@@ -2828,17 +2836,29 @@ def finish_nnsight(self, finished_req_ids: list[str]) -> Optional[bytes]:
         if internal_id in finished_req_id_set:
             matched.append((internal_id, mediator))
 
-    # Run "result" phase and collect saves
+    # Run "result" phase and collect per-invoke saves
     for internal_id, mediator in matched:
         with self.nnsight_model._interleaver:
             self.nnsight_model._interleaver.handle("result", outputs)
             mediator.cancel()
 
-    # Extract saved values from mediator frames
     for _, mediator in matched:
         for key, value in mediator.info.frame.f_locals.items():
             if id(value) in Globals.saves:
                 saves[key] = value
+
+    # Collect trace-shared saves when all mediators are done
+    for req_id in matched_keys:
+        for _, ctx in self.nnsight_request_helper.trace_contexts.items():
+            if req_id in ctx["pending_req_ids"]:
+                ctx["pending_req_ids"].discard(req_id)
+                if (not ctx["pending_req_ids"]
+                        and ctx["received_count"] == ctx["expected_count"]):
+                    canonical = ctx["canonical_globals"]
+                    for name in ctx["saved_names"]:
+                        if name in canonical and id(canonical[name]) in Globals.saves:
+                            saves[name] = canonical[name]
+                break
 
     return pickle.dumps(saves)
 ```
