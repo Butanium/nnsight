@@ -144,6 +144,318 @@ class TestDiffusionBatching:
             assert out2.shape[0] >= 1
 
 
+    @torch.no_grad()
+    def test_text_encoder_batching(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                encoder_out_1 = tiny_sd.text_encoder.text_model.encoder.layers[-1].output.save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                encoder_out_2 = tiny_sd.text_encoder.text_model.encoder.layers[-1].output.save()
+
+            with tracer.invoke(wave_prompt):
+                encoder_out_3 = tiny_sd.text_encoder.text_model.encoder.layers[-1].output.save()
+
+            with tracer.invoke():
+                encoder_out_all = tiny_sd.text_encoder.text_model.encoder.layers[-1].output.save()
+
+        assert encoder_out_all.shape[0] == encoder_out_1.shape[0] + encoder_out_2.shape[0] + encoder_out_3.shape[0]
+        assert encoder_out_1.shape[0] == 1
+        assert encoder_out_2.shape[0] == 2
+        assert encoder_out_3.shape[0] == 1
+
+        assert torch.all(encoder_out_1 == encoder_out_all[0:1])
+        assert torch.all(encoder_out_2 == encoder_out_all[1:3])
+        assert torch.all(encoder_out_3 == encoder_out_all[3:])
+
+    @torch.no_grad()
+    def test_unet_batching(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=1.0,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                unet_out_1 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                unet_out_2 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke(wave_prompt):
+                unet_out_3 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke():
+                unet_out_all = tiny_sd.unet.output[0].save()
+
+        assert unet_out_all.shape[0] == unet_out_1.shape[0] + unet_out_2.shape[0] + unet_out_3.shape[0]
+        assert unet_out_1.shape[0] == 3
+        assert unet_out_2.shape[0] == 6
+        assert unet_out_3.shape[0] == 3
+
+        assert torch.all(unet_out_1 == unet_out_all[0:3])
+        assert torch.all(unet_out_2 == unet_out_all[3:9])
+        assert torch.all(unet_out_3 == unet_out_all[9:])
+
+    @torch.no_grad()
+    def test_unet_batching_with_guidance(
+        self,
+        tiny_sd, 
+        cat_prompt, 
+        panda_prompt, 
+        birthday_cake_prompt, 
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=7.5,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                unet_out_1 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                unet_out_2 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke(wave_prompt):
+                unet_out_3 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke():
+                unet_out_all = tiny_sd.unet.output[0].save()
+
+        assert unet_out_all.shape[0] == unet_out_1.shape[0] + unet_out_2.shape[0] + unet_out_3.shape[0]
+        assert unet_out_1.shape[0] == 6
+        assert unet_out_2.shape[0] == 12
+        assert unet_out_3.shape[0] == 6
+
+        assert torch.all(unet_out_1 == torch.cat([unet_out_all[0:3], unet_out_all[12:15]], dim=0))
+        assert torch.all(unet_out_2 == torch.cat([unet_out_all[3:9], unet_out_all[15:21]], dim=0))
+        assert torch.all(unet_out_3 == torch.cat([unet_out_all[9:12], unet_out_all[21:24]], dim=0))
+
+    @torch.no_grad()
+    def test_vae_batching(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=1.0,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                vae_decoder_out_1 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                vae_decoder_out_2 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke(wave_prompt):
+                vae_decoder_out_3 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke():
+                vae_decoder_out_all = tiny_sd.vae.decoder.output.save()
+
+        assert vae_decoder_out_all.shape[0] == vae_decoder_out_1.shape[0] + vae_decoder_out_2.shape[0] + vae_decoder_out_3.shape[0]
+        assert vae_decoder_out_1.shape[0] == 3
+        assert vae_decoder_out_2.shape[0] == 6
+        assert vae_decoder_out_3.shape[0] == 3
+
+        assert torch.all(vae_decoder_out_1 == vae_decoder_out_all[0:3])
+        assert torch.all(vae_decoder_out_2 == vae_decoder_out_all[3:9])
+        assert torch.all(vae_decoder_out_3 == vae_decoder_out_all[9:])
+
+    @torch.no_grad()
+    def test_text_encoder_swapping(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        module = tiny_sd.text_encoder.text_model.encoder.layers[-1]
+
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                module.output = torch.ones_like(module.output) * 0
+                encoder_out_1 = module.output.save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                module.output = torch.ones_like(module.output) * 1
+                encoder_out_2 = module.output.save()
+
+            with tracer.invoke(wave_prompt):
+                module.output = torch.ones_like(module.output) * 2
+                encoder_out_3 = module.output.save()
+            
+            with tracer.invoke():
+                encoder_out_all = module.output.save()
+
+        assert encoder_out_all.shape[0] == encoder_out_1.shape[0] + encoder_out_2.shape[0] + encoder_out_3.shape[0]
+        assert encoder_out_1.shape[0] == 1
+        assert encoder_out_2.shape[0] == 2
+        assert encoder_out_3.shape[0] == 1
+
+        assert torch.all(encoder_out_1 == encoder_out_all[0:1])
+        assert torch.all(encoder_out_2 == encoder_out_all[1:3])
+        assert torch.all(encoder_out_3 == encoder_out_all[3:])
+        
+
+    @torch.no_grad()
+    def test_unet_swapping(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=1.0,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 0,)
+                unet_out_1 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 1,)
+                unet_out_2 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke(wave_prompt):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 2,)
+                unet_out_3 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke():
+                unet_out_all = tiny_sd.unet.output[0].save()
+
+        assert unet_out_all.shape[0] == unet_out_1.shape[0] + unet_out_2.shape[0] + unet_out_3.shape[0]
+        assert unet_out_1.shape[0] == 3
+        assert unet_out_2.shape[0] == 6
+        assert unet_out_3.shape[0] == 3
+
+        assert torch.all(unet_out_1 == unet_out_all[0:3])
+        assert torch.all(unet_out_2 == unet_out_all[3:9])
+        assert torch.all(unet_out_3 == unet_out_all[9:])
+
+
+    @torch.no_grad()
+    def test_unet_swapping_with_guidance(
+        self,
+        tiny_sd, 
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=7.5,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 0,)
+                unet_out_1 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 1,)
+                unet_out_2 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke(wave_prompt):
+                tiny_sd.unet.output = (torch.ones_like(tiny_sd.unet.output[0]) * 2,)
+                unet_out_3 = tiny_sd.unet.output[0].save()
+
+            with tracer.invoke():
+                unet_out_all = tiny_sd.unet.output[0].save()
+
+        assert unet_out_all.shape[0] == unet_out_1.shape[0] + unet_out_2.shape[0] + unet_out_3.shape[0]
+        assert unet_out_1.shape[0] == 6
+        assert unet_out_2.shape[0] == 12
+        assert unet_out_3.shape[0] == 6
+
+        assert torch.all(unet_out_1 == torch.cat([unet_out_all[0:3], unet_out_all[12:15]], dim=0))
+        assert torch.all(unet_out_2 == torch.cat([unet_out_all[3:9], unet_out_all[15:21]], dim=0))
+        assert torch.all(unet_out_3 == torch.cat([unet_out_all[9:12], unet_out_all[21:24]], dim=0))
+
+
+    @torch.no_grad()
+    def test_vae_swapping(
+        self,
+        tiny_sd,
+        cat_prompt,
+        panda_prompt,
+        birthday_cake_prompt,
+        wave_prompt
+    ):
+        with tiny_sd.generate(
+            num_inference_steps=20,
+            num_images_per_prompt=3,
+            guidance_scale=1.0,
+            seed=423
+        ) as tracer:
+
+            with tracer.invoke(cat_prompt):
+                tiny_sd.vae.decoder.output = torch.ones_like(tiny_sd.vae.decoder.output) * 0
+                unet_out_1 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke([panda_prompt, birthday_cake_prompt]):
+                tiny_sd.vae.decoder.output = torch.ones_like(tiny_sd.vae.decoder.output) * 1
+                unet_out_2 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke(wave_prompt):
+                tiny_sd.vae.decoder.output = torch.ones_like(tiny_sd.vae.decoder.output) * 2
+                unet_out_3 = tiny_sd.vae.decoder.output.save()
+
+            with tracer.invoke():
+                unet_out_all = tiny_sd.vae.decoder.output.save()
+
+        assert unet_out_all.shape[0] == unet_out_1.shape[0] + unet_out_2.shape[0] + unet_out_3.shape[0]
+        assert unet_out_1.shape[0] == 3
+        assert unet_out_2.shape[0] == 6
+        assert unet_out_3.shape[0] == 3
+
+        assert torch.all(unet_out_1 == unet_out_all[0:3])
+        assert torch.all(unet_out_2 == unet_out_all[3:9])
+        assert torch.all(unet_out_3 == unet_out_all[9:])
+
+
 # =============================================================================
 # Iteration Tests
 # =============================================================================
@@ -223,7 +535,8 @@ class TestDiffusionMetaLoading:
     def test_meta_loading_creates_meta_params(self):
         """dispatch=False creates model with meta-device parameters (no weights downloaded)."""
         model = DiffusionModel(
-            "hf-internal-testing/tiny-stable-diffusion-pipe",
+            "segmind/tiny-sd",
+            torch_dtype=torch.float16,
             safety_checker=None,
             dispatch=False,
         )
@@ -240,7 +553,8 @@ class TestDiffusionMetaLoading:
     def test_meta_loading_auto_dispatches_on_trace(self, sd_prompt):
         """dispatch=False model auto-dispatches real weights on first trace."""
         model = DiffusionModel(
-            "hf-internal-testing/tiny-stable-diffusion-pipe",
+            "segmind/tiny-sd",
+            torch_dtype=torch.float16,
             safety_checker=None,
             dispatch=False,
         )

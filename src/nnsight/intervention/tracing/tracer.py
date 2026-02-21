@@ -317,7 +317,7 @@ class InterleavingTracer(Tracer):
 
         self.mediators: List[Mediator] = []
 
-        self.batcher = Batcher()
+        self.batcher = model._batcher_class()(*args, **kwargs)
 
         self._frame = None
 
