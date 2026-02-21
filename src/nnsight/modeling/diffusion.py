@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Optional, Type
+from typing import TYPE_CHECKING, ClassVar, Optional, Type
 
 import torch
 from diffusers import DiffusionPipeline, pipelines
 from transformers import PreTrainedTokenizerBase
 
 from .. import util
+from ..intervention.batching import DiffusionBatcher
 from .huggingface import HuggingFaceModel
+
+if TYPE_CHECKING:
+    from ..intervention.batching import Batcher
 
 
 def _resolve_component_cls(lib_name: str, cls_name: str):
@@ -29,6 +33,9 @@ def _resolve_component_cls(lib_name: str, cls_name: str):
     """
     import diffusers as _diffusers
     import transformers as _transformers
+
+    if cls_name is None:
+        return None
 
     # Normalize Flax/TF class names to their PyTorch equivalents
     for prefix in ("Flax", "TF"):
@@ -271,6 +278,10 @@ class DiffusionModel(HuggingFaceModel):
 
         super().__init__(*args, **kwargs)
 
+    @classmethod
+    def _batcher_class(cls) -> ClassVar[Type["Batcher"]]:
+        return DiffusionBatcher
+
     def _load_config(self, repo_id: str, revision: Optional[str] = None):
         """Load and cache the pipeline's ``model_index.json`` config.
 
@@ -379,7 +390,7 @@ class DiffusionModel(HuggingFaceModel):
         batched_args, batched_kwargs = batched_input
 
         if len(args) > 0:
-            combined_prompts = list(batched_args[0]) + list(args[0])
+            combined_prompts = (list(batched_args[0]) if len(batched_args) > 0 else []) + list(args[0])
         else:
             combined_prompts = list(batched_args[0])
 

@@ -166,7 +166,8 @@ def tiny_sd(device: str):
     from nnsight import DiffusionModel
 
     return DiffusionModel(
-        "hf-internal-testing/tiny-stable-diffusion-pipe",
+        "segmind/tiny-sd",
+        torch_dtype=torch.float16,
         safety_checker=None,
         dispatch=True,
     ).to(device)
@@ -177,6 +178,21 @@ def sd_prompt():
     """Simple prompt for diffusion model tests."""
     return "A photo of a cat"
 
+@pytest.fixture(scope="module")
+def cat_prompt():
+    return "A brown and white cat staring off with pretty green eyes"
+
+@pytest.fixture(scope="module")
+def panda_prompt():
+    return "A red panda eating a bamboo"
+
+@pytest.fixture(scope="module")
+def birthday_cake_prompt():
+    return "A birthday cake with candles"
+
+@pytest.fixture(scope="module")
+def wave_prompt():
+    return "The great wave off Kanagawa"
 
 @pytest.fixture(scope="module")
 def flux(device: str, request):
