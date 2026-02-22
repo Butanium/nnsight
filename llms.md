@@ -627,10 +627,10 @@ print(final_logits)  # NameError: 'final_logits' is not defined
 
 **Solutions:**
 
-1. **Use a separate empty invoker** (recommended):
+1. **Use a separate empty invoker** (recommended). When using multiple invokes, do not pass input to `generate()` — pass it to the first invoke:
    ```python
-   with model.generate("Hello", max_new_tokens=3) as tracer:
-       with tracer.invoke():  # First invoker - handles iteration
+   with model.generate(max_new_tokens=3) as tracer:
+       with tracer.invoke("Hello"):  # First invoker - pass input here
            with tracer.iter[:]:
                hidden = model.transformer.h[-1].output.save()
        
@@ -1574,7 +1574,7 @@ This shows internal NNsight frames, which can help:
 | `OutOfOrderError: Value was missed for model.layer.output.i0` | Accessed modules in wrong order within an invoke | Access modules in forward-pass order |
 | `ValueError: Execution complete but ... was not provided` | Mediator still waiting - module never called or gradient order wrong | Check module path exists; access gradients in reverse order |
 | `ValueError: Cannot return output of Envoy that is not interleaving` | Trace has no input, model never ran | Provide input to `.trace(input)` or use `.invoke()` |
-| `ValueError: Cannot invoke during an active model execution` | Tried to create invoke inside another invoke | Use sequential, non-nested invokes |
+| `ValueError: Cannot invoke during an active model execution` | Passed input to `generate()` while using multiple invokes | Use `model.generate(max_new_tokens=N)` with no input; pass prompt to first `tracer.invoke("Hello")` |
 | `ValueError: Cannot request ... in a backwards tracer` | Accessed `.output`/`.input` inside `backward()` instead of `.grad` | Define tensors before backward, access `.grad` inside |
 | `AttributeError: ... has no attribute X` | Nonexistent module accessed | Use `print(model)` to see available modules |
 | `AttributeError: Tokenizer not found` | Wrapped pre-loaded model without providing tokenizer | Provide `tokenizer=` when wrapping pre-loaded models |
