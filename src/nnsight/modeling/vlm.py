@@ -281,9 +281,13 @@ class VisionLanguageModel(LanguageModel):
         for row_start, mask in [(0, attention_mask), (n_old, new_attention_mask)]:
             if mask is not None:
                 if left:
-                    combined_mask[row_start : row_start + mask.shape[0], -mask.shape[1] :] = mask
+                    combined_mask[
+                        row_start : row_start + mask.shape[0], -mask.shape[1] :
+                    ] = mask
                 else:
-                    combined_mask[row_start : row_start + mask.shape[0], : mask.shape[1]] = mask
+                    combined_mask[
+                        row_start : row_start + mask.shape[0], : mask.shape[1]
+                    ] = mask
 
         new_batched_inputs["attention_mask"] = combined_mask
 
@@ -321,6 +325,9 @@ class VisionLanguageModel(LanguageModel):
             tuple(),
             {**new_batched_inputs, **merged_extra, "labels": batched_labels},
         )
+
+    def _remoteable_model_key(self) -> str:
+        return super()._remoteable_model_key()
 
     def _remoteable_persistent_objects(self) -> dict:
         persistent_objects = super()._remoteable_persistent_objects()
