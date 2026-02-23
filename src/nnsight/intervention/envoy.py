@@ -392,7 +392,7 @@ class Envoy(Batchable):
                     return fn
 
             source, line_numbers, forward = inject(
-                type(self._module).forward, wrap, self._module.__path__
+                type(self._module).forward, wrap, self.path
             )
 
             if hasattr(self._module, "_old_forward"):
@@ -405,7 +405,7 @@ class Envoy(Batchable):
                 self._module.forward = MethodType(forward, self._module)
 
             self._source = EnvoySource(
-                self._module.__path__,
+                self.path,
                 source,
                 line_numbers,
                 interleaver=self._interleaver,
@@ -1148,6 +1148,10 @@ class Envoy(Batchable):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+
+        self._fake_inputs = inspect._empty
+        self._fake_output = inspect._empty
+        self._source = None
 
 
 # TODO extend Envoy

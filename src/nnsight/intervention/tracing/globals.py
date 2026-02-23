@@ -37,7 +37,6 @@ class Object(torch.Tensor):
 
         return self
 
-
     def __getattr__(self, name: str) -> Self:
 
         return super().__getattr__(name)
@@ -110,3 +109,9 @@ class Globals:
     @staticmethod
     def exit():
         Globals.stack -= 1
+
+    @staticmethod
+    def clear():
+        Globals.saves.clear()
+        Globals.cache.clear()
+        Globals.stack = 0
