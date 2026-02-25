@@ -269,9 +269,17 @@ class NNsightGPUModelRunner(GPUModelRunner):
             matched_keys = []
 
             for req_id, mediator in self.nnsight_request_helper.mediators.items():
-                internal_id = req_id.split("-")[0]
-                if internal_id in finished_req_id_set:
-                    matched.append((internal_id, mediator))
+                # vLLM appends a hash suffix to request IDs:
+                #   sync path: "0-abc123" -> engine reports "0"
+                #   async path: "uuid-abc123" -> engine reports "uuid"
+                # Use rsplit to strip only the suffix, preserving
+                # hyphens in UUIDs. Fall back to split for legacy compat.
+                base_id = req_id.rsplit("-", 1)[0]
+                if base_id in finished_req_id_set:
+                    matched.append((base_id, mediator))
+                    matched_keys.append(req_id)
+                elif req_id in finished_req_id_set:
+                    matched.append((req_id, mediator))
                     matched_keys.append(req_id)
 
             Globals.enter()

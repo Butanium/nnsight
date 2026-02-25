@@ -75,6 +75,8 @@ class VLLM(RemoteableMixin):
 
     def __init__(self, *args, **kwargs) -> None:
 
+        self._async_engine: bool = kwargs.pop("async_engine", False)
+
         self.vllm_entrypoint: LLM = None
         self.tokenizer: "AnyTokenizer" = None
 
@@ -157,20 +159,33 @@ class VLLM(RemoteableMixin):
         destroy_model_parallel()
         destroy_distributed_environment()
 
-        if kwargs.get("distributed_executor_backend") == "ray":
-            from .executors.ray_workaround import NNsightRayExecutor
-            kwargs["distributed_executor_backend"] = NNsightRayExecutor
+        if self._async_engine:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.v1.engine.async_llm import AsyncLLM
 
-        llm = LLM(
-            repo_id,
-            worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
-            enforce_eager=True,
-            **kwargs,
-        )
+            engine_args = AsyncEngineArgs(
+                model=repo_id,
+                worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
+                enforce_eager=True,
+                **kwargs,
+            )
+            async_llm = AsyncLLM.from_engine_args(engine_args)
+            self.vllm_entrypoint = async_llm
+        else:
+            if kwargs.get("distributed_executor_backend") == "ray":
+                from .executors.ray_workaround import NNsightRayExecutor
+                kwargs["distributed_executor_backend"] = NNsightRayExecutor
 
-        llm.llm_engine.__class__ = NNsightLLMEngine
+            llm = LLM(
+                repo_id,
+                worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
+                enforce_eager=True,
+                **kwargs,
+            )
 
-        self.vllm_entrypoint = llm
+            llm.llm_engine.__class__ = NNsightLLMEngine
+
+            self.vllm_entrypoint = llm
 
         return meta_model
 
@@ -284,19 +299,21 @@ class VLLM(RemoteableMixin):
 
         return batched_args, batched_kwargs
 
-    def __call__(
+    def _prepare_generation(
         self,
         prompts: List[str],
         params: List[NNsightSamplingParams],
         **kwargs,
-    ) -> Any:
-        """Execute vLLM generation with NNsight interventions.
+    ) -> Tuple[List[str], List[NNsightSamplingParams]]:
+        """Serialize mediators and attach them to sampling params.
 
-        Attaches mediators to sampling params so the vLLM workers can
-        deserialize and run intervention code, then collects saved
-        variables from the outputs.
+        Collects all input mediators from the interleaver, serializes
+        each one into the corresponding ``NNsightSamplingParams.extra_args``,
+        and propagates any root-trace kwargs to params that still carry
+        defaults.
 
-        Each mediator maps to exactly one prompt/param (1:1).
+        Returns:
+            ``(prompts, params)`` with mediator data attached.
         """
 
         default_param = NNsightSamplingParams.from_optional()
@@ -340,6 +357,21 @@ class VLLM(RemoteableMixin):
                 ) == getattr(default_param, attr):
                     setattr(param, attr, value)
 
+        return prompts, params
+
+    def __call__(
+        self,
+        prompts: List[str],
+        params: List[NNsightSamplingParams],
+        **kwargs,
+    ) -> Any:
+        """Execute synchronous vLLM generation with NNsight interventions.
+
+        Each mediator maps to exactly one prompt/param (1:1).
+        """
+
+        prompts, params = self._prepare_generation(prompts, params, **kwargs)
+
         # Do VLLM generation with NNsight
         outputs = self.vllm_entrypoint.generate(prompts, sampling_params=params)
 
@@ -357,6 +389,16 @@ class VLLM(RemoteableMixin):
 
         # Push the variables to the interleaver frame
         push_variables(self._interleaver.mediators[0].info.frame, saves)
+
+    def trace(self, *inputs, **kwargs):
+        if self._async_engine and kwargs.get('backend') is None and not kwargs.get('remote'):
+            from .async_backend import AsyncVLLMBackend
+            from .async_tracer import AsyncInterleavingTracer
+
+            kwargs['backend'] = AsyncVLLMBackend(self)
+            # Bypass RemoteableMixin to pass custom tracer_cls.
+            return Envoy.trace(self, *inputs, tracer_cls=AsyncInterleavingTracer, **kwargs)
+        return super().trace(*inputs, **kwargs)
 
     def interleave(self, fn: Callable, *args, **kwargs):
         """Execute the traced function with vLLM, dispatching the engine if needed."""
