@@ -1,42 +1,37 @@
-import copy
-from typing import Optional
 from vllm.sampling_params import SamplingParams
-from ...intervention.interleaver import Mediator
-from ...intervention.serialization import save
-from msgspec import structs
-from typing import List
-
-
-def rebuild(state):
-    return NNsightSamplingParams(**state)
 
 
 class NNsightSamplingParams(SamplingParams):
-    mediator: Optional[Mediator | bytes] = None
+    """Extended vLLM ``SamplingParams`` for NNsight requests.
 
-    def __reduce__(self):
+    Used for ``is_default_param`` tracking and type identification
+    in ``_prepare_input``. Mediator data is transported via the
+    built-in ``extra_args`` dict field.
+    """
 
-        state = structs.asdict(self)
-
-        state["mediator"] = self.mediator
-
-        if isinstance(self.mediator, Mediator):
-
-            state["mediator"] = save(self.mediator)
-
-        return (rebuild, (state,))
-
-    def clone(self):
-
-        memo = (
-            {}
-            if self.logits_processors is None
-            else {
-                id(lp): lp.clone() if hasattr(lp, "clone") else lp
-                for lp in self.logits_processors
-            }
+    def __repr__(self) -> str:
+        return (
+            f"SamplingParams(n={self.n}, "
+            f"presence_penalty={self.presence_penalty}, "
+            f"frequency_penalty={self.frequency_penalty}, "
+            f"repetition_penalty={self.repetition_penalty}, "
+            f"temperature={self.temperature}, "
+            f"top_p={self.top_p}, "
+            f"top_k={self.top_k}, "
+            f"min_p={self.min_p}, "
+            f"seed={self.seed}, "
+            f"stop={self.stop}, "
+            f"stop_token_ids={self.stop_token_ids}, "
+            f"bad_words={self.bad_words}, "
+            f"include_stop_str_in_output={self.include_stop_str_in_output}, "
+            f"ignore_eos={self.ignore_eos}, "
+            f"max_tokens={self.max_tokens}, "
+            f"min_tokens={self.min_tokens}, "
+            f"logprobs={self.logprobs}, "
+            f"prompt_logprobs={self.prompt_logprobs}, "
+            f"skip_special_tokens={self.skip_special_tokens}, "
+            "spaces_between_special_tokens="
+            f"{self.spaces_between_special_tokens}, "
+            f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
+            f"structured_outputs={self.structured_outputs}, "
         )
-
-        memo[id(self.mediator)] = self.mediator
-
-        return copy.deepcopy(self, memo=memo)

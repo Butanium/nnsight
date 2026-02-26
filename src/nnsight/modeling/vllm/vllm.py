@@ -1,14 +1,26 @@
 from ... import NNS_VLLM_VERSION
 
-import torch
+import atexit
+import uuid
 import vllm
+
+# Check vLLM version compatibility
+_installed_version = getattr(vllm, "__version__", "unknown")
+if _installed_version != NNS_VLLM_VERSION:
+    raise ImportError(
+        f"nnsight requires vLLM version {NNS_VLLM_VERSION}, but found {_installed_version}. "
+        f"Please install the correct version:\n\n"
+        f"    pip install vllm=={NNS_VLLM_VERSION}\n"
+    )
+
+import torch
 
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple, Union
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.inputs import TokensPrompt
 
-from vllm import LLM, envs
+from vllm import LLM
 from vllm.distributed import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -19,11 +31,13 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.llm import LLM
 
 from ...intervention.envoy import Envoy
+from ...intervention.tracing.globals import Globals
 from ...intervention.tracing.tracer import ScanningTracer
 from ...intervention.tracing.util import push_variables
 from ...util import WrapperModule
 from ..mixins import RemoteableMixin
 from .sampling import NNsightSamplingParams
+from ...intervention.serialization import save as serialize
 from ... import save
 from .engines.engine import NNsightLLMEngine
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
@@ -32,9 +46,6 @@ if TYPE_CHECKING:
     from torch.nn import Module
 
     from vllm.transformers_utils.tokenizer import AnyTokenizer
-
-
-envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
 
 
 class VLLM(RemoteableMixin):
@@ -64,6 +75,13 @@ class VLLM(RemoteableMixin):
 
     def __init__(self, *args, **kwargs) -> None:
 
+        mode = kwargs.pop("mode", "sync")
+        if mode not in ("sync", "async"):
+            raise ValueError(
+                f"Invalid mode {mode!r}. Must be 'sync' or 'async'."
+            )
+        self._async_engine: bool = mode == "async"
+
         self.vllm_entrypoint: LLM = None
         self.tokenizer: "AnyTokenizer" = None
 
@@ -91,11 +109,24 @@ class VLLM(RemoteableMixin):
                 tensor_model_parallel_size=1, pipeline_model_parallel_size=1
             )
 
+        atexit.register(VLLM._cleanup_distributed)
+
         super().__init__(*args, **kwargs)
 
         self.logits: Envoy = WrapperModule()
         self.samples: Envoy = WrapperModule()
         self.generator: Envoy = WrapperModule()
+
+    @staticmethod
+    def _cleanup_distributed():
+        try:
+            destroy_model_parallel()
+        except Exception:
+            pass
+        try:
+            destroy_distributed_environment()
+        except Exception:
+            pass
 
     def _load_meta(self, repo_id: str, **kwargs) -> "Module":
 
@@ -133,22 +164,61 @@ class VLLM(RemoteableMixin):
         destroy_model_parallel()
         destroy_distributed_environment()
 
-        llm = LLM(
-            repo_id,
-            worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
-            enforce_eager=True,
-            **kwargs,
-        )
+        # Swap Ray executor for both sync and async paths.
+        _uses_ray = kwargs.get("distributed_executor_backend") == "ray"
+        if _uses_ray:
+            from .executors.ray_workaround import NNsightRayExecutor
+            kwargs["distributed_executor_backend"] = NNsightRayExecutor
 
-        llm.llm_engine.__class__ = NNsightLLMEngine
+        if self._async_engine:
+            # AsyncLLM spawns EngineCore in a subprocess.  When using Ray,
+            # the subprocess needs a running Ray cluster to connect to via
+            # ray.init(address="auto").  Pre-initialize Ray here so the
+            # cluster is available before the subprocess starts.
+            if _uses_ray:
+                import ray
+                if not ray.is_initialized():
+                    ray.init()
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.v1.engine.async_llm import AsyncLLM
 
-        self.vllm_entrypoint = llm
+            engine_args = AsyncEngineArgs(
+                model=repo_id,
+                worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
+                enforce_eager=True,
+                **kwargs,
+            )
+            async_llm = AsyncLLM.from_engine_args(engine_args)
+            self.vllm_entrypoint = async_llm
+        else:
+            llm = LLM(
+                repo_id,
+                worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
+                enforce_eager=True,
+                **kwargs,
+            )
+
+            llm.llm_engine.__class__ = NNsightLLMEngine
+
+            self.vllm_entrypoint = llm
 
         return meta_model
 
     def _prepare_input(
         self, *args, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
+        """Normalize a single user input into ``((prompts, params), kwargs, batch_size)``.
+
+        Accepts a single string, a single token ID list, or a single-sequence
+        HuggingFace tokenizer output and converts it into a vLLM-compatible
+        prompt with :class:`NNsightSamplingParams`.
+
+        Each invoke must contain exactly one prompt.  To process multiple
+        prompts, use separate ``tracer.invoke()`` calls.
+
+        Returns:
+            Tuple of ``((prompts, params), kwargs, batch_size)``.
+        """
 
         prompts = []
         params = []
@@ -172,52 +242,69 @@ class VLLM(RemoteableMixin):
                     if batch_input_ids == []:
                         raise ValueError("Empty list of token ids is not allowed")
                     if isinstance(batch_input_ids[0], int):
-                        # list of token ids
+                        # single sequence of token ids
                         batch_input_ids = [batch_input_ids]
                         batch_attention_mask = [batch_attention_mask]
 
-                    for input_ids, attention_mask in zip(
-                        batch_input_ids, batch_attention_mask
-                    ):
-                        prompt = TokensPrompt(
-                            prompt_token_ids=[
-                                t for t, m in zip(input_ids, attention_mask) if m != 0
-                            ]
+                    if len(batch_input_ids) > 1:
+                        raise ValueError(
+                            "Multiple prompts per invoke are not supported. "
+                            "Use separate tracer.invoke() calls for each prompt."
                         )
-                        prompts.append(prompt)
-                        params.append(NNsightSamplingParams(**kwargs))
+
+                    input_ids = batch_input_ids[0]
+                    attention_mask = batch_attention_mask[0]
+                    prompt = TokensPrompt(
+                        prompt_token_ids=[
+                            t for t, m in zip(input_ids, attention_mask) if m != 0
+                        ]
+                    )
+                    prompts.append(prompt)
+                    params.append(NNsightSamplingParams(**kwargs))
                     continue
 
-            if type(arg) is not list or isinstance(arg[0], int):
-                # if arg is a list of ints (token ids), we also need to wrap it in a list
+            if type(arg) is list and isinstance(arg[0], int):
+                # single list of token ids
                 arg = [arg]
-
-            for i, prompt in enumerate(arg):
-
-                param = NNsightSamplingParams(
-                    **kwargs,
+            elif type(arg) is not list:
+                # single string
+                arg = [arg]
+            else:
+                # arg is a list but not of ints — reject multi-prompt
+                raise ValueError(
+                    "Multiple prompts per invoke are not supported. "
+                    "Use separate tracer.invoke() calls for each prompt."
                 )
 
-                if kwargs != {}:
-                    param.is_default_param = False
+            prompt = arg[0]
 
-                if type(prompt) is list and isinstance(prompt[0], int):
-                    prompt = TokensPrompt(prompt_token_ids=prompt)
+            param = NNsightSamplingParams(
+                **kwargs,
+            )
 
-                prompts.append(prompt)
-                params.append(param)
+            if kwargs != {}:
+                param.is_default_param = False
 
-        return (prompts, params), {}
+            if type(prompt) is list and isinstance(prompt[0], int):
+                prompt = TokensPrompt(prompt_token_ids=prompt)
+
+            prompts.append(prompt)
+            params.append(param)
+
+        kwargs = kwargs if not args else {}
+
+        return (prompts, params), kwargs, len(prompts)
 
     def _batch(
         self, batched_inputs, prompts, params, **kwargs
     ) -> Tuple[Tuple[Tuple[Any], Dict[str, Any]], int]:
+        """Combine multiple invokes' prompts and sampling params into a single batch."""
 
-        batch_size = len(prompts)
+        kwargs = {**kwargs, **batched_inputs[1]}
 
-        if batched_inputs is None:
+        if len(batched_inputs[0]) == 0:
 
-            return ((prompts, params), kwargs), batch_size
+            return (prompts, params), kwargs
 
         batched_args = batched_inputs[0]
         batched_kwargs = batched_inputs[1]
@@ -225,9 +312,67 @@ class VLLM(RemoteableMixin):
         batched_args[0].extend(prompts)
         batched_args[1].extend(params)
 
-        batched_kwargs.update(kwargs)
+        return batched_args, batched_kwargs
 
-        return batched_inputs, batch_size
+    def _prepare_generation(
+        self,
+        prompts: List[str],
+        params: List[NNsightSamplingParams],
+        **kwargs,
+    ) -> Tuple[List[str], List[NNsightSamplingParams]]:
+        """Serialize mediators and attach them to sampling params.
+
+        Collects all input mediators from the interleaver, serializes
+        each one into the corresponding ``NNsightSamplingParams.extra_args``,
+        and propagates any root-trace kwargs to params that still carry
+        defaults.
+
+        Returns:
+            ``(prompts, params)`` with mediator data attached.
+        """
+
+        default_param = NNsightSamplingParams.from_optional()
+
+        # Collect all input mediators (those with batch_group, i.e. not empty invokes)
+        input_mediators = []
+        for mediator in self._interleaver.mediators:
+            if mediator.batch_group is not None:
+                mediator.intervention.__source__ = "".join(mediator.info.source)
+                input_mediators.append(mediator)
+
+        # Compute saved_names: parent-frame variable names whose values are in Globals.saves.
+        # These are variables defined in the parent trace scope (e.g., shared lists)
+        # that need to be collected after all invokes complete on the worker.
+        saved_names = []
+        if input_mediators:
+            frame_globals = input_mediators[0].intervention.__globals__
+            saved_names = [
+                name for name, val in frame_globals.items()
+                if id(val) in Globals.saves
+            ]
+
+        trace_id = str(uuid.uuid4())
+
+        param_idx = 0
+        for idx, mediator in enumerate(input_mediators):
+            param = params[param_idx]
+            param.extra_args = {
+                "nnsight_mediator": serialize(mediator),
+                "nnsight_trace_id": trace_id,
+                "nnsight_trace_idx": idx,
+                "nnsight_saved_names": saved_names,
+                "nnsight_expected_count": len(input_mediators),
+            }
+            param_idx += 1
+
+            # Update the sampling params with any kwargs passed to the root trace
+            for attr, value in kwargs.items():
+                if hasattr(NNsightSamplingParams, attr) and getattr(
+                    param, attr
+                ) == getattr(default_param, attr):
+                    setattr(param, attr, value)
+
+        return prompts, params
 
     def __call__(
         self,
@@ -235,40 +380,12 @@ class VLLM(RemoteableMixin):
         params: List[NNsightSamplingParams],
         **kwargs,
     ) -> Any:
+        """Execute synchronous vLLM generation with NNsight interventions.
 
-        default_param = NNsightSamplingParams.from_optional()
+        Each mediator maps to exactly one prompt/param (1:1).
+        """
 
-        kwargs.pop("hook", None)
-
-        param_idx = 0
-
-        # Find the sampling params associated with each mediator
-        for mediator in self._interleaver.mediators:
-
-            batch_start, batch_size = mediator.batch_group
-
-            # If its the only invoker in the batch group, set the batch size to the total number of prompts
-            if batch_size == -1:
-                batch_size = len(params)
-
-            # For each prompt in the batch group associated with the mediator
-            for i in range(batch_size):
-
-                param = params[param_idx]
-
-                # If its the first prompt in the batch group, it will transfer the mediator to the workers
-                if i == 0:
-
-                    param.mediator = mediator
-
-                param_idx += 1
-
-                # Update the sampling params for each prompt with any kwargs passed to the root trace
-                for attr, value in kwargs.items():
-                    if hasattr(NNsightSamplingParams, attr) and getattr(
-                        param, attr
-                    ) == getattr(default_param, attr):
-                        setattr(param, attr, value)
+        prompts, params = self._prepare_generation(prompts, params, **kwargs)
 
         # Do VLLM generation with NNsight
         outputs = self.vllm_entrypoint.generate(prompts, sampling_params=params)
@@ -288,9 +405,21 @@ class VLLM(RemoteableMixin):
         # Push the variables to the interleaver frame
         push_variables(self._interleaver.mediators[0].info.frame, saves)
 
+    def trace(self, *inputs, **kwargs):
+        if self._async_engine and kwargs.get('backend') is None and not kwargs.get('remote'):
+            from .async_backend import AsyncVLLMBackend
+            from .async_tracer import AsyncInterleavingTracer
+
+            kwargs['backend'] = AsyncVLLMBackend(self)
+            # Bypass RemoteableMixin to pass custom tracer_cls.
+            return Envoy.trace(self, *inputs, tracer_cls=AsyncInterleavingTracer, **kwargs)
+        return super().trace(*inputs, **kwargs)
+
     def interleave(self, fn: Callable, *args, **kwargs):
         """Execute the traced function with vLLM, dispatching the engine if needed."""
-        if not self.dispatched and not isinstance(self._interleaver.tracer, ScanningTracer):
+        if not self.dispatched and not isinstance(
+            self._interleaver.tracer, ScanningTracer
+        ):
             self.dispatch()
 
         try:
@@ -299,8 +428,21 @@ class VLLM(RemoteableMixin):
             self._interleaver.check_cache_full()
             self._interleaver.cancel()
 
+    def _remoteable_persistent_objects(self) -> dict:
+        persistent_objects = super()._remoteable_persistent_objects()
+        persistent_objects["Tokenizer"] = self.tokenizer
+        return persistent_objects
 
-if TYPE_CHECKING:
+    def __getstate__(self):
 
-    class VLLM(VLLM, LLM):
-        pass
+        state = super().__getstate__()
+        state["vllm_entrypoint"] = None
+        if self.tokenizer is not None:
+            self.tokenizer._persistent_id = "Tokenizer"
+        state["tokenizer"] = self.tokenizer
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.vllm_entrypoint = state["vllm_entrypoint"]
+        self.tokenizer = state["tokenizer"]

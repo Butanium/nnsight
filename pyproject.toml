@@ -2,6 +2,7 @@
 requires = ["setuptools>=61", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 [tool.setuptools_scm]
+write_to = "src/nnsight/_version.py"
 
 [project]
 dynamic = ["version"]
@@ -40,6 +41,7 @@ dependencies = [
     "toml",
     "ipython",
     "rich",
+    "zstandard",
 ]
 
 [project.optional-dependencies]
@@ -49,13 +51,18 @@ test = [
 ]
 
 
+diffusers = [
+    "diffusers",
+]
+
+
 vllm = [
     "vllm>=0.12",
     "triton==3.5.0",
 ]
 
 
-all = ["nnsight[test,vllm]"]
+all = ["nnsight[test,diffusers,vllm]"]
 
 [project.urls]
 Homepage = "https://github.com/ndif-team/nnsight"
