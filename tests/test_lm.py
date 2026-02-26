@@ -553,6 +553,19 @@ class TestInvokerBatching:
                 invoke_logits3 = gpt2.lm_head.output[:, -1].save()
 
         assert torch.allclose(list_logits3, invoke_logits3, atol=1e-5)
+        
+        
+    @torch.no_grad()
+    def test_invoker_input_ids(self, gpt2: nnsight.LanguageModel):
+        """Test that input IDs are copied when batching."""
+        with gpt2.trace() as tracer:
+            with tracer.invoke("Hello") as invoker:
+                x = invoker.inputs[1]['input_ids'].save()
+            
+            with tracer.invoke("Hello2"):
+                pass
+
+        assert isinstance(x, torch.Tensor)
 
 
 # =============================================================================

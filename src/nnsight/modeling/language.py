@@ -320,7 +320,7 @@ class LanguageModel(TransformersModel):
             Tuple of ``(args, kwargs)`` representing the combined batch.
         """
 
-        batched_inputs = batched_inputs[1]
+        batched_inputs = batched_inputs[1].copy()
 
         if "input_ids" not in batched_inputs:
             return tuple(), {**prepared_kwargs, **batched_inputs}
