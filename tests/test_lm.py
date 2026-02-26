@@ -568,6 +568,21 @@ class TestInvokerBatching:
         assert isinstance(x, torch.Tensor)
 
 
+    @torch.no_grad()
+    def test_token_ids_batching(self, gpt2: nnsight.LanguageModel):
+        input_tokens = gpt2.tokenizer("The Eiffel Tower is in the city of", return_tensors="pt")["input_ids"]
+        input_tokens2 = gpt2.tokenizer("Madison Square Garden is located in the city of", return_tensors="pt")["input_ids"]
+
+        with gpt2.trace() as tracer:
+            with tracer.invoke(input_tokens):
+                logits = gpt2.lm_head.output[0, -1].save()
+            
+            with tracer.invoke(input_tokens2):
+                logits_2 = gpt2.lm_head.output[0, -1].save()
+
+        assert logits.shape == logits_2.shape
+
+
 # =============================================================================
 # Scanning and Validation
 # =============================================================================

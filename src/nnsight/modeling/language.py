@@ -319,7 +319,6 @@ class LanguageModel(TransformersModel):
         Returns:
             Tuple of ``(args, kwargs)`` representing the combined batch.
         """
-
         batched_inputs = batched_inputs[1].copy()
 
         if "input_ids" not in batched_inputs:
@@ -327,7 +326,7 @@ class LanguageModel(TransformersModel):
 
         batched_labels = batched_inputs["labels"]
 
-        attention_mask = batched_inputs["attention_mask"]
+        attention_mask = batched_inputs.get("attention_mask", torch.ones_like(batched_inputs["input_ids"]))
 
         batched_ids = [
             {"input_ids": ids}
