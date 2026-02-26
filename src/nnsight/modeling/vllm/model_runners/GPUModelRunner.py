@@ -166,6 +166,113 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
             model._interleaver.mediators = mediators
 
+        def match_req_ids(self, req_id_set: set) -> List[tuple]:
+            """Match engine-reported request IDs to stored mediators.
+
+            vLLM appends a hash suffix to request IDs (e.g. ``"0-abc123"``
+            or ``"uuid-abc123"``).  This method strips the suffix with
+            ``rsplit`` and falls back to an exact match.
+
+            Returns:
+                List of ``(base_id, mediator, internal_key)`` tuples.
+            """
+            matched = []
+            for req_id, mediator in self.mediators.items():
+                base_id = req_id.rsplit("-", 1)[0]
+                if base_id in req_id_set:
+                    matched.append((base_id, mediator, req_id))
+                elif req_id in req_id_set:
+                    matched.append((req_id, mediator, req_id))
+            return matched
+
+        def finalize_mediators(self, matched, finished_req_id_set, model: VLLM) -> set:
+            """Run result handler and cancel finished mediators.
+
+            Returns:
+                Set of internal keys for mediators that were finalized.
+            """
+            finished_internal_keys = set()
+            for base_id, mediator, internal_key in matched:
+                if base_id not in finished_req_id_set:
+                    continue
+
+                finished_internal_keys.add(internal_key)
+
+                Globals.enter()
+                if mediator.alive:
+                    model._interleaver.mediators = [mediator]
+                    mediator.batch_group = None
+                    with model._interleaver:
+                        model._interleaver.handle("result", [base_id])
+                        mediator.cancel()
+                        model._interleaver.handle()
+                Globals.exit()
+
+            return finished_internal_keys
+
+        def collect_saves(self, matched, finished_internal_keys: set) -> tuple:
+            """Collect saved values from mediator frames.
+
+            Gathers per-invoke saves from frame locals and trace-shared
+            saves from canonical globals (only when a trace is fully done).
+
+            Returns:
+                ``(saves, removals)`` — the saves dict and set of
+                ``id()`` values to discard from ``Globals.saves``.
+            """
+            saves = {}
+            removals = set()
+
+            for base_id, mediator, internal_key in matched:
+                frame = mediator.info.frame
+                for key, value in frame.f_locals.items():
+                    if id(value) in Globals.saves:
+                        saves[key] = value
+                        if internal_key in finished_internal_keys:
+                            removals.add(id(value))
+
+            # Trace-shared saves: collect when ALL mediators for a trace
+            # have been received AND completed.
+            for internal_key in finished_internal_keys:
+                for _, ctx in self.trace_contexts.items():
+                    if internal_key in ctx["pending_req_ids"]:
+                        ctx["pending_req_ids"].discard(internal_key)
+                        trace_fully_done = (
+                            not ctx["pending_req_ids"]
+                            and ctx["received_count"] == ctx["expected_count"]
+                        )
+                        if trace_fully_done:
+                            canonical = ctx["canonical_globals"]
+                            for name in ctx["saved_names"]:
+                                if name in canonical:
+                                    value = canonical[name]
+                                    if id(value) in Globals.saves:
+                                        saves[name] = value
+                                        removals.add(id(value))
+                        break
+
+            return saves, removals
+
+        def cleanup_finished(self, finished_internal_keys: set, removals: set) -> None:
+            """Clean up state for finished requests.
+
+            Removes entries from ``Globals.saves``, deletes completed
+            trace contexts, and drops mediator entries.
+            """
+            for _id in removals:
+                Globals.saves.discard(_id)
+
+            done_traces = [
+                tid for tid, ctx in self.trace_contexts.items()
+                if (not ctx["pending_req_ids"]
+                    and ctx["received_count"] == ctx["expected_count"])
+            ]
+            for tid in done_traces:
+                del self.trace_contexts[tid]
+
+            for internal_key in finished_internal_keys:
+                self.mediators.pop(internal_key, None)
+
     def __init__(self, *args, **kwargs):
 
         from .. import VLLM
@@ -253,108 +360,37 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
         return sampler_output
 
-    def finish_nnsight(
-        self, finished_req_ids: list[str]
+    def collect_nnsight(
+        self,
+        req_ids: list[str],
+        finished_req_ids: list[str] | None = None,
     ) -> Optional[bytes]:
-        result = None
+        """Collect saved values from mediators, optionally finalizing finished requests.
 
+        Called on every streamed output (async) or on finished requests (sync).
+        Saves are collected for ALL ``req_ids``.  Mediators listed in
+        ``finished_req_ids`` are additionally finalized (result handler,
+        cancel) and cleaned up.
+
+        Args:
+            req_ids: Request IDs to collect current saves from.
+            finished_req_ids: Subset of request IDs that are finished and
+                should be finalized and cleaned up.  ``None`` means no
+                requests are finished.
+        """
+        if get_pp_group().rank != 0:
+            return None
+
+        if finished_req_ids is None:
+            finished_req_ids = []
+
+        helper = self.nnsight_request_helper
+        req_id_set = set(req_ids) | set(finished_req_ids)
         finished_req_id_set = set(finished_req_ids)
 
-        if get_pp_group().rank == 0:
+        matched = helper.match_req_ids(req_id_set)
+        finished_keys = helper.finalize_mediators(matched, finished_req_id_set, self.nnsight_model)
+        saves, removals = helper.collect_saves(matched, finished_keys)
+        helper.cleanup_finished(finished_keys, removals)
 
-            # Match finished engine-level req_ids to our stored mediators.
-            # Use the mediators dict (keyed by internal req_id like "0-abc123")
-            # since self.requests may already be cleaned up in multiprocessing mode.
-            matched = []
-            matched_keys = []
-
-            for req_id, mediator in self.nnsight_request_helper.mediators.items():
-                # vLLM appends a hash suffix to request IDs:
-                #   sync path: "0-abc123" -> engine reports "0"
-                #   async path: "uuid-abc123" -> engine reports "uuid"
-                # Use rsplit to strip only the suffix, preserving
-                # hyphens in UUIDs. Fall back to split for legacy compat.
-                base_id = req_id.rsplit("-", 1)[0]
-                if base_id in finished_req_id_set:
-                    matched.append((base_id, mediator))
-                    matched_keys.append(req_id)
-                elif req_id in finished_req_id_set:
-                    matched.append((req_id, mediator))
-                    matched_keys.append(req_id)
-
-            Globals.enter()
-
-            for internal_id, mediator in matched:
-
-                if mediator.alive:
-
-                    self.nnsight_model._interleaver.mediators = [mediator]
-                    mediator.batch_group = None
-
-                    with self.nnsight_model._interleaver:
-                        self.nnsight_model._interleaver.handle("result", [internal_id])
-
-                        mediator.cancel()
-
-                        self.nnsight_model._interleaver.handle()
-
-            Globals.exit()
-
-            saves = {}
-
-            removals = set()
-
-            # Per-invoke local saves: collect from each mediator's frame
-            for _, mediator in matched:
-                frame = mediator.info.frame
-
-                for key, value in frame.f_locals.items():
-
-                    if id(value) in Globals.saves:
-                        saves[key] = value
-                        removals.add(id(value))
-
-            # Trace-shared saves: decrement pending counts and collect
-            # shared vars when ALL mediators for a trace have been received
-            # AND completed. Must wait for all to avoid premature cleanup
-            # (e.g., request 0 finishes before request 1 is even scheduled).
-            for req_id in matched_keys:
-                for _, ctx in self.nnsight_request_helper.trace_contexts.items():
-                    if req_id in ctx["pending_req_ids"]:
-                        ctx["pending_req_ids"].discard(req_id)
-                        trace_fully_done = (
-                            not ctx["pending_req_ids"]
-                            and ctx["received_count"] == ctx["expected_count"]
-                        )
-                        if trace_fully_done:
-                            # All mediators received and finished —
-                            # collect shared saves from canonical globals
-                            canonical = ctx["canonical_globals"]
-                            for name in ctx["saved_names"]:
-                                if name in canonical:
-                                    value = canonical[name]
-                                    if id(value) in Globals.saves:
-                                        saves[name] = value
-                                        removals.add(id(value))
-                        break
-
-            # Clean up fully completed trace contexts
-            done_traces = [
-                tid for tid, ctx in self.nnsight_request_helper.trace_contexts.items()
-                if (not ctx["pending_req_ids"]
-                    and ctx["received_count"] == ctx["expected_count"])
-            ]
-            for tid in done_traces:
-                del self.nnsight_request_helper.trace_contexts[tid]
-
-            for _id in removals:
-                Globals.saves.discard(_id)
-
-            # Pickle so it survives msgpack transport in multiprocessing mode
-            result = pickle.dumps(saves)
-
-            # Clean up mediator entries for finished requests
-            for req_id in matched_keys:
-                self.nnsight_request_helper.mediators.pop(req_id, None)
-
-        return result
+        return pickle.dumps(saves)

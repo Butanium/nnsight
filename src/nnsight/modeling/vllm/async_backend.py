@@ -55,7 +55,12 @@ class AsyncVLLMBackend(Backend):
         return self._stream()
 
     async def _stream(self):
-        """Async generator that submits to AsyncLLM and streams results."""
+        """Async generator that submits to AsyncLLM and streams results.
+
+        On every output, collects current saves from the worker via
+        ``collect_nnsight``.  When the request finishes, the mediator
+        is also finalized and cleaned up.
+        """
         if self._prompts is None:
             raise RuntimeError(
                 "No prepared data. Ensure model.trace() context has exited "
@@ -69,12 +74,13 @@ class AsyncVLLMBackend(Backend):
         async for output in self.model.vllm_entrypoint.generate(
             prompt, param, request_id
         ):
-            if output.finished:
-                results = await self.model.vllm_entrypoint.collective_rpc(
-                    "finish_nnsight", args=([output.request_id],)
-                )
-                saves_bytes = next((r for r in results if r is not None), None)
-                if saves_bytes:
-                    saves = pickle.loads(saves_bytes)
-                    output.saves = saves
+            finished = [output.request_id] if output.finished else None
+            results = await self.model.vllm_entrypoint.collective_rpc(
+                "collect_nnsight",
+                args=([output.request_id], finished),
+            )
+            saves_bytes = next((r for r in results if r is not None), None)
+            if saves_bytes:
+                saves = pickle.loads(saves_bytes)
+                output.saves = saves
             yield output

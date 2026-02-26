@@ -2439,9 +2439,11 @@ with model.generate("A landscape", num_inference_steps=30) as tracer:
 
 ### 6.5 vLLM
 
-vLLM integration provides high-performance inference with NNsight interventions. This is one of the most complex integrations due to vLLM's optimized architecture.
+vLLM integration provides high-performance inference with NNsight interventions. This is one of the most complex integrations due to vLLM's optimized architecture. Both synchronous (`LLM`) and asynchronous (`AsyncLLM`) engines are supported.
 
 #### High-Level Architecture
+
+**Sync Path:**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -2453,21 +2455,19 @@ vLLM integration provides high-performance inference with NNsight interventions.
        v
 ┌─────────────────────────────────────────────────────────┐
 │  VLLM Class                                             │
-│  - Instantiates empty 'meta' model for envoy tree       │
 │  - Serializes mediators + trace metadata into extra_args │
-│  - If Ray: swaps "ray" for NNsightRayExecutor class     │
 │  - Sends prompts + params to vLLM engine                │
 └───────┬───────────────────────────────────────▲─────────┘
         │                                       │
 ┌───────v───────────────────────────────────────┼──────────────────────┐
 │  NNsightLLMEngine                             │                      │
 │       │            - Detects finished requests │                      │
-│       │            - Calls finish_nnsight() to collect saved values   │
+│       │            - Calls collect_nnsight() to collect saved values  │
 └───────┼───────────────────────────────────────▲──────────────────────┘
         │                                       │
 ┌───────v───────────────────────────────────────┴──────────────────────────────────────────┐
 │  NNsightGPUModelRunner - Pre-wrapped NNsight model                                       │
-│  - Deserializes mediators, grafts shared globals  finish_nnsight()                       │
+│  - Deserializes mediators, grafts shared globals  collect_nnsight()                      │
 │  - Manages batch groups (flat <-> unflatten)      4.) Handles "result" provider          │
 │  - Runs interleaving at multiple phases           - Collects per-invoke + shared saves   │
 │    1.) Forward Pass                               - Returns pickled bytes                │
@@ -2476,7 +2476,38 @@ vLLM integration provides high-performance inference with NNsight interventions.
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Async Path:**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  User Code                                              │
+│  with model.trace("Hello", ...) as tracer:              │
+│      logits = model.logits.output.save()                │
+│                                                         │
+│  async for output in tracer.backend():                  │
+│      print(output.saves)  # saves on every output       │
+└──────┬──────────────────────────────────────────────────┘
+       │
+       v
+┌─────────────────────────────────────────────────────────┐
+│  AsyncInterleavingTracer.execute()                      │
+│  - Serializes mediators, stores prepared data on tracer │
+│  - Does NOT trigger synchronous generation              │
+└──────┬──────────────────────────────────────────────────┘
+       │
+       v
+┌─────────────────────────────────────────────────────────┐
+│  AsyncVLLMBackend._stream()                             │
+│  - Submits to AsyncLLM.generate()                       │
+│  - On each output: collective_rpc("collect_nnsight")    │
+│  - Attaches saves to every RequestOutput                │
+│  - Yields to user                                       │
+└─────────────────────────────────────────────────────────┘
+```
+
 #### Usage
+
+**Sync (default):**
 
 ```python
 from nnsight.modeling.vllm import VLLM
@@ -2494,6 +2525,24 @@ with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
 print(output)
 ```
 
+**Async (streaming):**
+
+```python
+import asyncio
+from nnsight.modeling.vllm import VLLM
+
+model = VLLM("gpt2", tensor_parallel_size=1, dispatch=True, mode="async")
+
+async def main():
+    with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
+        logits = model.logits.output.save()
+
+    async for output in tracer.backend():
+        print(f"finished={output.finished}, saves={list(output.saves.keys())}")
+
+asyncio.run(main())
+```
+
 For multi-GPU with Ray:
 
 ```python
@@ -2506,7 +2555,7 @@ model = VLLM("gpt2", tensor_parallel_size=2, distributed_executor_backend="ray",
 
 vLLM loads models through its own infrastructure. NNsight wraps the loaded model.
 
-**User-side (`_load`):** Creates a `vllm.LLM` with `worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker"`. If `distributed_executor_backend="ray"`, the string is replaced with `NNsightRayExecutor` (a custom executor class). After creation, the engine class is patched to `NNsightLLMEngine`.
+**User-side (`_load`):** When `mode="async"`, creates an `AsyncLLM` via `AsyncLLM.from_engine_args()`. Otherwise, creates a `vllm.LLM` and patches the engine class to `NNsightLLMEngine`. Both paths use `worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker"`. If `distributed_executor_backend="ray"`, the string is replaced with `NNsightRayExecutor` (a custom executor class).
 
 **Worker-side (`NNsightGPUModelRunner.load_model`):**
 
@@ -2820,48 +2869,36 @@ class NNsightRequestHelper:
             batch_start += num_tokens
 ```
 
-When requests finish, `finish_nnsight()` receives a list of finished request IDs from the engine:
-1. Matches request IDs to stored mediators
-2. Runs final interleaving for the "result" provider
-3. Collects per-invoke saved values from mediator frames
-4. Collects trace-shared saved values from canonical `__globals__` (only when ALL mediators for a trace have been received and completed)
-5. Returns pickled bytes (survives msgpack transport in multiprocessing mode)
-6. Cleans up mediator entries and completed trace contexts
+When saves need to be collected, `collect_nnsight(req_ids, finished_req_ids)` is called:
+- **Sync path**: Called by `NNsightLLMEngine.step()` when requests finish (both args are the same list)
+- **Async path**: Called by `AsyncVLLMBackend` via `collective_rpc` on every streamed output. Intermediate outputs pass `finished_req_ids=None` (collect saves without finalizing); the final output passes the request ID to also finalize and clean up.
+
+The method delegates to helper methods on `NNsightRequestHelper`:
 
 ```python
-def finish_nnsight(self, finished_req_ids: list[str]) -> Optional[bytes]:
-    # Match finished engine-level req_ids to stored mediators
-    for req_id, mediator in self.nnsight_request_helper.mediators.items():
-        internal_id = req_id.split("-")[0]
-        if internal_id in finished_req_id_set:
-            matched.append((internal_id, mediator))
+def collect_nnsight(self, req_ids, finished_req_ids=None):
+    if get_pp_group().rank != 0:
+        return None
 
-    # Run "result" phase and collect per-invoke saves
-    for internal_id, mediator in matched:
-        with self.nnsight_model._interleaver:
-            self.nnsight_model._interleaver.handle("result", outputs)
-            mediator.cancel()
+    helper = self.nnsight_request_helper
+    req_id_set = set(req_ids) | set(finished_req_ids or [])
+    finished_req_id_set = set(finished_req_ids or [])
 
-    for _, mediator in matched:
-        for key, value in mediator.info.frame.f_locals.items():
-            if id(value) in Globals.saves:
-                saves[key] = value
-
-    # Collect trace-shared saves when all mediators are done
-    for req_id in matched_keys:
-        for _, ctx in self.nnsight_request_helper.trace_contexts.items():
-            if req_id in ctx["pending_req_ids"]:
-                ctx["pending_req_ids"].discard(req_id)
-                if (not ctx["pending_req_ids"]
-                        and ctx["received_count"] == ctx["expected_count"]):
-                    canonical = ctx["canonical_globals"]
-                    for name in ctx["saved_names"]:
-                        if name in canonical and id(canonical[name]) in Globals.saves:
-                            saves[name] = canonical[name]
-                break
+    matched = helper.match_req_ids(req_id_set)              # Match engine IDs to mediators
+    finished_keys = helper.finalize_mediators(               # Run result handler + cancel
+        matched, finished_req_id_set, self.nnsight_model)
+    saves, removals = helper.collect_saves(                  # Gather from frames + globals
+        matched, finished_keys)
+    helper.cleanup_finished(finished_keys, removals)         # Clean up state
 
     return pickle.dumps(saves)
 ```
+
+Helper methods:
+1. **`match_req_ids()`** — Matches engine-reported request IDs to stored mediators. Handles vLLM's hash suffix via `rsplit("-", 1)[0]`, preserving UUID hyphens.
+2. **`finalize_mediators()`** — For finished requests, enters the interleaver and runs the "result" handler, then cancels the mediator.
+3. **`collect_saves()`** — Gathers per-invoke saves from frame locals (for ALL matched mediators) and trace-shared saves from canonical globals (only when all mediators for a trace are done). Intermediate saves are not removed from `Globals.saves` so they can be re-collected on the next streaming step.
+4. **`cleanup_finished()`** — Removes finished save IDs from `Globals.saves`, deletes completed trace contexts, and drops mediator entries.
 
 ---
 
@@ -2914,6 +2951,35 @@ vLLM's `EngineArgs.distributed_executor_backend` accepts `type[Executor]`, so pa
 The rest of the NNsight integration (`worker_cls`, `collective_rpc`, `execute_model`, mediator transport via `extra_args`) works identically across Ray and multiprocessing backends.
 
 **Multi-node support:** For multi-node tensor parallelism (TP workers on different machines), set `RAY_ADDRESS` to an existing Ray cluster's GCS address (`host:6379`, **not** `ray://host:port`). The executor joins the cluster as a driver-only node and places workers across available nodes. See [`src/nnsight/modeling/vllm/README.md`](src/nnsight/modeling/vllm/README.md) for full architectural details, and [`src/nnsight/modeling/vllm/examples/multi_node_with_ray/`](src/nnsight/modeling/vllm/examples/multi_node_with_ray/) for a Docker-based multi-node example.
+
+---
+
+#### Async Engine
+
+The async engine enables streaming token-by-token output with NNsight interventions using vLLM's `AsyncLLM`. Pass `mode="async"` to `VLLM()` to enable it.
+
+**Key components:**
+
+| Component | Role |
+|-----------|------|
+| `AsyncInterleavingTracer` | Overrides `execute()` to prepare generation data without triggering sync generation. Stores `(prompts, params, kwargs)` on `self.prepared`. |
+| `AsyncVLLMBackend` | Dual-call backend. First call (from `__exit__`) compiles and prepares. Second call (from user) returns an async generator streaming `RequestOutput` objects. |
+| `VLLM.trace()` override | Detects `mode="async"` and injects async backend/tracer. Bypasses `RemoteableMixin.trace()` by calling `Envoy.trace()` directly. |
+
+**Execution flow:**
+
+1. `VLLM.trace()` injects `AsyncVLLMBackend` and `AsyncInterleavingTracer`
+2. Trace `__exit__` calls `backend(tracer)` — compiles user code and runs `AsyncInterleavingTracer.execute()` which serializes mediators but does not start generation
+3. User calls `tracer.backend()` which returns the `_stream()` async generator
+4. `_stream()` submits to `AsyncLLM.generate()` and on each output calls `collect_nnsight` via `collective_rpc`
+5. Saves are attached as `output.saves` on every `RequestOutput` (not just the final one)
+6. When the request finishes, the mediator is also finalized and cleaned up
+
+**Streaming saves:** On intermediate outputs, saves are collected from frame locals but the mediator is not finalized — its entries stay in `Globals.saves` so they can be re-collected next step. On the final output, the mediator is finalized (result handler + cancel) and all state is cleaned up.
+
+**Ray support:** The async engine works with the Ray distributed executor (`distributed_executor_backend="ray"`). Since `AsyncLLM` spawns the EngineCore as a subprocess, `VLLM._load()` pre-initializes Ray in the main process so the subprocess can connect via `ray.init(address="auto")`.
+
+See [`src/nnsight/modeling/vllm/README.md`](src/nnsight/modeling/vllm/README.md) for the full async architecture diagram and comparison table.
 
 ---
 

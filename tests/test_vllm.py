@@ -8,7 +8,10 @@ These tests cover vLLM-specific features:
 - Activation interventions
 - Batched operations
 - Tensor parallelism
+- Async engine with streaming saves
 """
+
+import asyncio
 
 import pytest
 import torch
@@ -497,3 +500,306 @@ class TestCrossInvokeSharedState:
         assert len(out_ids) == 2
         assert len(out_ids[0]) == num_tokens
         assert len(out_ids[1]) == num_tokens
+
+
+# =============================================================================
+# Async Engine
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def async_loop():
+    """Create a shared event loop for all async tests.
+
+    AsyncLLM binds its background tasks to the event loop that created
+    it, so all tests must share the same loop.
+    """
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="module")
+def vllm_gpt2_async(tp: int, async_loop):
+    """Load GPT-2 model with vLLM async engine."""
+    return VLLM(
+        "gpt2",
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=0.1,
+        dispatch=True,
+        mode="async",
+    )
+
+
+class TestAsyncEngine:
+    """Tests for async vLLM engine with streaming saves."""
+
+    def test_async_basic_streaming(
+        self, vllm_gpt2_async, async_loop, ET_prompt: str
+    ):
+        """Test that async engine streams multiple outputs."""
+
+        async def run():
+            with vllm_gpt2_async.trace(
+                ET_prompt, temperature=0.0, max_tokens=5
+            ) as tracer:
+                logits = vllm_gpt2_async.logits.output.save()
+
+            count = 0
+            async for output in tracer.backend():
+                count += 1
+
+            assert count > 1, f"Expected streaming outputs, got {count}"
+
+        async_loop.run_until_complete(run())
+
+    def test_async_saves_on_every_output(
+        self, vllm_gpt2_async, async_loop, ET_prompt: str
+    ):
+        """Test that saves are attached to every streamed output, not just the final one."""
+
+        async def run():
+            with vllm_gpt2_async.trace(
+                ET_prompt, temperature=0.0, max_tokens=5
+            ) as tracer:
+                logits = vllm_gpt2_async.logits.output.save()
+
+            count = 0
+            saves_count = 0
+            async for output in tracer.backend():
+                count += 1
+                if hasattr(output, "saves") and output.saves:
+                    saves_count += 1
+                    assert "logits" in output.saves
+                    assert output.saves["logits"].shape[-1] == 50257
+
+            assert saves_count == count, (
+                f"Expected saves on every output, got {saves_count}/{count}"
+            )
+
+        async_loop.run_until_complete(run())
+
+    def test_async_finished_flag(
+        self, vllm_gpt2_async, async_loop, ET_prompt: str
+    ):
+        """Test that exactly the last output has finished=True."""
+
+        async def run():
+            with vllm_gpt2_async.trace(
+                ET_prompt, temperature=0.0, max_tokens=3
+            ) as tracer:
+                logits = vllm_gpt2_async.logits.output.save()
+
+            outputs = []
+            async for output in tracer.backend():
+                outputs.append(output)
+
+            assert len(outputs) >= 1
+            for o in outputs[:-1]:
+                assert not o.finished
+            assert outputs[-1].finished
+
+        async_loop.run_until_complete(run())
+
+    def test_async_intervention(
+        self, vllm_gpt2_async, async_loop, ET_prompt: str
+    ):
+        """Test activation intervention through the async path."""
+
+        async def run():
+            # Clean run (no intervention)
+            with vllm_gpt2_async.trace(
+                ET_prompt, temperature=0.0, max_tokens=1
+            ) as tracer:
+                logits = vllm_gpt2_async.logits.output.save()
+
+            clean_saves = None
+            async for output in tracer.backend():
+                if hasattr(output, "saves") and output.saves:
+                    clean_saves = output.saves
+
+            assert clean_saves is not None
+            clean_token = vllm_gpt2_async.tokenizer.decode(
+                clean_saves["logits"].argmax(dim=-1)
+            )
+            assert clean_token == " Paris"
+
+            # Corrupted run (zero out MLP)
+            with vllm_gpt2_async.trace(
+                ET_prompt, temperature=0.0, max_tokens=1
+            ) as tracer:
+                vllm_gpt2_async.transformer.h[-2].mlp.output = torch.zeros_like(
+                    vllm_gpt2_async.transformer.h[-2].mlp.output
+                )
+                logits = vllm_gpt2_async.logits.output.save()
+
+            corrupted_saves = None
+            async for output in tracer.backend():
+                if hasattr(output, "saves") and output.saves:
+                    corrupted_saves = output.saves
+
+            assert corrupted_saves is not None
+            corrupted_token = vllm_gpt2_async.tokenizer.decode(
+                corrupted_saves["logits"].argmax(dim=-1)
+            )
+            assert corrupted_token != " Paris"
+
+        async_loop.run_until_complete(run())
+
+    def test_async_text_output(
+        self, vllm_gpt2_async, async_loop, MSG_prompt: str
+    ):
+        """Test that streamed text output is non-empty."""
+
+        async def run():
+            with vllm_gpt2_async.trace(
+                MSG_prompt, temperature=0.0, max_tokens=3
+            ) as tracer:
+                logits = vllm_gpt2_async.logits.output.save()
+
+            texts = []
+            async for output in tracer.backend():
+                if output.outputs:
+                    texts.append(output.outputs[0].text)
+
+            assert len(texts) > 0
+            # Final text should have content
+            assert len(texts[-1].strip()) > 0
+
+        async_loop.run_until_complete(run())
+
+
+# =============================================================================
+# Async Engine + Ray Distributed Executor
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def async_ray_loop():
+    """Create a separate event loop for async + Ray tests.
+
+    AsyncLLM binds to the loop that created it, so the async Ray model
+    needs its own loop (distinct from the plain async model's loop).
+    """
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="module")
+def vllm_gpt2_async_ray(async_ray_loop):
+    """Load GPT-2 model with async vLLM engine + Ray distributed executor."""
+    if not _has_ray:
+        pytest.skip("Ray not installed")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Need at least 2 GPUs for Ray executor")
+    return VLLM(
+        "gpt2",
+        tensor_parallel_size=2,
+        distributed_executor_backend="ray",
+        gpu_memory_utilization=0.1,
+        dispatch=True,
+        mode="async",
+    )
+
+
+@pytest.mark.skipif(
+    not _has_ray or torch.cuda.device_count() < 2,
+    reason="Async Ray tests require ray package and at least 2 GPUs",
+)
+class TestAsyncRayExecutor:
+    """Tests for async vLLM engine with Ray distributed executor.
+
+    Validates that async streaming + NNsight interventions work correctly
+    when vLLM uses the NNsightRayExecutor backend.
+    """
+
+    def test_async_ray_basic_streaming(
+        self, vllm_gpt2_async_ray, async_ray_loop, ET_prompt: str
+    ):
+        """Test that async + Ray engine streams multiple outputs."""
+
+        async def run():
+            with vllm_gpt2_async_ray.trace(
+                ET_prompt, temperature=0.0, max_tokens=5
+            ) as tracer:
+                logits = vllm_gpt2_async_ray.logits.output.save()
+
+            count = 0
+            async for output in tracer.backend():
+                count += 1
+
+            assert count > 1, f"Expected streaming outputs, got {count}"
+
+        async_ray_loop.run_until_complete(run())
+
+    def test_async_ray_saves_on_every_output(
+        self, vllm_gpt2_async_ray, async_ray_loop, ET_prompt: str
+    ):
+        """Test saves attached to every streamed output with Ray backend."""
+
+        async def run():
+            with vllm_gpt2_async_ray.trace(
+                ET_prompt, temperature=0.0, max_tokens=5
+            ) as tracer:
+                logits = vllm_gpt2_async_ray.logits.output.save()
+
+            count = 0
+            saves_count = 0
+            async for output in tracer.backend():
+                count += 1
+                if hasattr(output, "saves") and output.saves:
+                    saves_count += 1
+                    assert "logits" in output.saves
+                    assert output.saves["logits"].shape[-1] == 50257
+
+            assert saves_count == count, (
+                f"Expected saves on every output, got {saves_count}/{count}"
+            )
+
+        async_ray_loop.run_until_complete(run())
+
+    def test_async_ray_intervention(
+        self, vllm_gpt2_async_ray, async_ray_loop, ET_prompt: str
+    ):
+        """Test activation intervention through async + Ray path."""
+
+        async def run():
+            # Clean run (no intervention)
+            with vllm_gpt2_async_ray.trace(
+                ET_prompt, temperature=0.0, max_tokens=1
+            ) as tracer:
+                logits = vllm_gpt2_async_ray.logits.output.save()
+
+            clean_saves = None
+            async for output in tracer.backend():
+                if hasattr(output, "saves") and output.saves:
+                    clean_saves = output.saves
+
+            assert clean_saves is not None
+            clean_token = vllm_gpt2_async_ray.tokenizer.decode(
+                clean_saves["logits"].argmax(dim=-1)
+            )
+            assert clean_token == " Paris"
+
+            # Corrupted run (zero out MLP)
+            with vllm_gpt2_async_ray.trace(
+                ET_prompt, temperature=0.0, max_tokens=1
+            ) as tracer:
+                vllm_gpt2_async_ray.transformer.h[-2].mlp.output = torch.zeros_like(
+                    vllm_gpt2_async_ray.transformer.h[-2].mlp.output
+                )
+                logits = vllm_gpt2_async_ray.logits.output.save()
+
+            corrupted_saves = None
+            async for output in tracer.backend():
+                if hasattr(output, "saves") and output.saves:
+                    corrupted_saves = output.saves
+
+            assert corrupted_saves is not None
+            corrupted_token = vllm_gpt2_async_ray.tokenizer.decode(
+                corrupted_saves["logits"].argmax(dim=-1)
+            )
+            assert corrupted_token != " Paris"
+
+        async_ray_loop.run_until_complete(run())

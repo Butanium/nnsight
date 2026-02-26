@@ -75,7 +75,12 @@ class VLLM(RemoteableMixin):
 
     def __init__(self, *args, **kwargs) -> None:
 
-        self._async_engine: bool = kwargs.pop("async_engine", False)
+        mode = kwargs.pop("mode", "sync")
+        if mode not in ("sync", "async"):
+            raise ValueError(
+                f"Invalid mode {mode!r}. Must be 'sync' or 'async'."
+            )
+        self._async_engine: bool = mode == "async"
 
         self.vllm_entrypoint: LLM = None
         self.tokenizer: "AnyTokenizer" = None
@@ -159,7 +164,21 @@ class VLLM(RemoteableMixin):
         destroy_model_parallel()
         destroy_distributed_environment()
 
+        # Swap Ray executor for both sync and async paths.
+        _uses_ray = kwargs.get("distributed_executor_backend") == "ray"
+        if _uses_ray:
+            from .executors.ray_workaround import NNsightRayExecutor
+            kwargs["distributed_executor_backend"] = NNsightRayExecutor
+
         if self._async_engine:
+            # AsyncLLM spawns EngineCore in a subprocess.  When using Ray,
+            # the subprocess needs a running Ray cluster to connect to via
+            # ray.init(address="auto").  Pre-initialize Ray here so the
+            # cluster is available before the subprocess starts.
+            if _uses_ray:
+                import ray
+                if not ray.is_initialized():
+                    ray.init()
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -172,10 +191,6 @@ class VLLM(RemoteableMixin):
             async_llm = AsyncLLM.from_engine_args(engine_args)
             self.vllm_entrypoint = async_llm
         else:
-            if kwargs.get("distributed_executor_backend") == "ray":
-                from .executors.ray_workaround import NNsightRayExecutor
-                kwargs["distributed_executor_backend"] = NNsightRayExecutor
-
             llm = LLM(
                 repo_id,
                 worker_cls="nnsight.modeling.vllm.workers.GPUWorker.NNsightGPUWorker",
