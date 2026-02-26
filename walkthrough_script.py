@@ -571,11 +571,12 @@ print(f"Generated {len(tokens)} tokens (step 2 had zeroed activations)")
 # print(final_output)  # NameError: 'final_output' is not defined
 # ```
 # 
-# **Solution:** Use a separate empty invoker for code that should run after iteration:
+# **Solution:** Use a separate empty invoker for code that should run after iteration.
+# When using multiple invokes, do not pass input to generate() — pass it to the first invoke:
 # 
 # ```python
-# with model.generate("Hello", max_new_tokens=3) as tracer:
-#     with tracer.invoke():  # First invoker handles iteration
+# with model.generate(max_new_tokens=3) as tracer:
+#     with tracer.invoke("Hello"):  # First invoker - pass input here
 #         with tracer.iter[:]:
 #             hidden = model.transformer.h[-1].output.save()
 #     
