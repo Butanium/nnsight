@@ -1516,10 +1516,10 @@ print(final_logits) # NameError: 'final_logits' is not defined!
 
 **Solutions:**
 
-1. **Use a separate empty invoker** (recommended):
+1. **Use a separate empty invoker** (recommended). When using multiple invokes, do not pass input to `generate()` — pass it to the first invoke:
    ```python
-   with model.generate("Hello", max_new_tokens=3) as tracer:
-       with tracer.invoke():  # First invoker - handles iteration
+   with model.generate(max_new_tokens=3) as tracer:
+       with tracer.invoke("Hello"):  # First invoker - pass input here
            for step in tracer.iter[:]:
                hidden = model.transformer.h[-1].output.save()
 

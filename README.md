@@ -239,13 +239,13 @@ with model.generate("Hello", max_new_tokens=5) as tracer:
         outputs.append(model.transformer.h[-1].output[0])
 ```
 
-> **⚠️ Warning:** Code after `tracer.iter[:]` never executes! The unbounded iterator waits forever for more steps. Put post-iteration code in a separate `tracer.invoke()`:
+> **⚠️ Warning:** Code after `tracer.iter[:]` never executes! The unbounded iterator waits forever for more steps. Put post-iteration code in a separate `tracer.invoke()`. When using multiple invokes, do not pass input to `generate()` — pass it to the first invoke:
 > ```python
-> with model.generate("Hello", max_new_tokens=3) as tracer:
->     with tracer.invoke():  # First invoker
+> with model.generate(max_new_tokens=3) as tracer:
+>     with tracer.invoke("Hello"):  # First invoker — pass input here
 >         for step in tracer.iter[:]:
 >             hidden = model.transformer.h[-1].output.save()
->     with tracer.invoke():  # Second invoker - runs after
+>     with tracer.invoke():  # Second invoker — runs after generation
 >         final = model.output.save()  # Now works!
 > ```
 
@@ -489,7 +489,8 @@ print(model)
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `OutOfOrderError: Value was missed...` | Accessed modules in wrong order | Access modules in forward-pass execution order |
-| `NameError` after `for step in tracer.iter[:]` | Code after unbounded iter doesn't run | Use separate `tracer.invoke()` for post-iteration code |
+| `NameError` after `tracer.iter[:]` | Code after unbounded iter doesn't run | Use separate `tracer.invoke()` for post-iteration code; pass input to first invoke, not `generate()` |
+| `ValueError: Cannot invoke during an active model execution` | Passed input to `generate()` while using multiple invokes | Use `model.generate(max_new_tokens=N)` with no input; pass prompt to first `tracer.invoke("Hello")` |
 | `ValueError: Cannot return output of Envoy...` | No input provided to trace | Provide input: `model.trace(input)` or use `tracer.invoke(input)` |
 
 For more debugging tips, see the [documentation](https://www.nnsight.net).
