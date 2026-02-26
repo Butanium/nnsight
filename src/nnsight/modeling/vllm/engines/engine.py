@@ -18,8 +18,8 @@ class NNsightLLMEngine(LLMEngine):
 
         if finished_req_ids:
             results = self.engine_core.collective_rpc(
-                "finish_nnsight",
-                args=(finished_req_ids,),
+                "collect_nnsight",
+                args=(finished_req_ids, finished_req_ids),
             )
             # results is a list (one per worker). Rank-0 returns pickled bytes, others None.
             saves_bytes = next((r for r in results if r is not None), None)

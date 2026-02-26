@@ -30,5 +30,5 @@ class NNsightGPUWorker(gpu_worker.Worker):
                 self.parallel_config.distributed_executor_backend = "ray"
         super().init_device()
 
-    def finish_nnsight(self, finished_req_ids: list[str]):
-        return self.model_runner.finish_nnsight(finished_req_ids)
+    def collect_nnsight(self, req_ids: list[str], finished_req_ids: list[str] | None = None):
+        return self.model_runner.collect_nnsight(req_ids, finished_req_ids)
